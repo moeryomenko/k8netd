@@ -5,6 +5,274 @@
 //! (red phase). TASK-003 implements the types in this file to make the tests
 //! pass; the tests module stays at the bottom of the file per Rust convention.
 
+use std::collections::HashMap;
+use std::fmt;
+use std::net::Ipv4Addr;
+use std::path::PathBuf;
+use std::str::FromStr;
+
+use serde::{Deserialize, Serialize};
+
+/// Error type for domain model construction and parsing failures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelError {
+    /// A required name was empty or whitespace-only.
+    EmptyName,
+    /// An IPv4 CIDR string could not be parsed or was invalid.
+    InvalidCidr(String),
+    /// A gateway address was unparseable or outside its network.
+    InvalidGateway(String),
+    /// An IP pool was invalid (reversed bounds, outside CIDR, or containing the gateway).
+    InvalidPool(String),
+    /// A MAC address string could not be parsed.
+    InvalidMac(String),
+}
+
+impl fmt::Display for ModelError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ModelError::EmptyName => write!(f, "name must not be empty or whitespace"),
+            ModelError::InvalidCidr(s) => write!(f, "invalid IPv4 CIDR: {s}"),
+            ModelError::InvalidGateway(s) => write!(f, "invalid gateway address: {s}"),
+            ModelError::InvalidPool(s) => write!(f, "invalid IP pool: {s}"),
+            ModelError::InvalidMac(s) => write!(f, "invalid MAC address: {s}"),
+        }
+    }
+}
+
+impl std::error::Error for ModelError {}
+
+/// An IPv4 CIDR block: a network address and prefix length (spec REQ-002).
+///
+/// Parsed from `"a.b.c.d/pp"`; the address must be a clean network address
+/// (no host bits set) and the prefix must be at most 32.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ipv4Cidr {
+    /// The network address (host bits cleared).
+    pub addr: Ipv4Addr,
+    /// The prefix length in bits (0..=32).
+    pub prefix: u8,
+}
+
+impl Ipv4Cidr {
+    /// Returns the 32-bit network mask for the prefix.
+    fn mask(&self) -> u32 {
+        if self.prefix == 0 {
+            0
+        } else {
+            u32::MAX << (32 - self.prefix)
+        }
+    }
+}
+
+impl FromStr for Ipv4Cidr {
+    type Err = ModelError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (addr_str, prefix_str) = s
+            .split_once('/')
+            .ok_or_else(|| ModelError::InvalidCidr(s.to_string()))?;
+        let addr: Ipv4Addr = addr_str.parse().map_err(|_| ModelError::InvalidCidr(s.to_string()))?;
+        let prefix: u8 = prefix_str.parse().map_err(|_| ModelError::InvalidCidr(s.to_string()))?;
+        if prefix > 32 {
+            return Err(ModelError::InvalidCidr(s.to_string()));
+        }
+        let cidr = Ipv4Cidr { addr, prefix };
+        if u32::from(addr) & cidr.mask() != u32::from(addr) {
+            return Err(ModelError::InvalidCidr(s.to_string()));
+        }
+        Ok(cidr)
+    }
+}
+
+impl fmt::Display for Ipv4Cidr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.addr, self.prefix)
+    }
+}
+
+/// An inclusive range of IPv4 addresses available for allocation (spec REQ-004).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpPool {
+    /// The first address in the pool.
+    pub start: Ipv4Addr,
+    /// The last address in the pool.
+    pub end: Ipv4Addr,
+}
+
+impl IpPool {
+    /// Creates a pool; rejects reversed bounds where `start` is greater than `end`.
+    pub fn new(start: Ipv4Addr, end: Ipv4Addr) -> Result<Self, ModelError> {
+        if u32::from(start) > u32::from(end) {
+            return Err(ModelError::InvalidPool(format!("start {start} is after end {end}")));
+        }
+        Ok(IpPool { start, end })
+    }
+}
+
+/// An L2 network segment: name, CIDR, gateway, and allocation pool (spec REQ-002).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Network {
+    /// The network name.
+    pub name: String,
+    /// The IPv4 CIDR block.
+    pub cidr: Ipv4Cidr,
+    /// The gateway address (inside the CIDR, outside the pool).
+    pub gateway: Ipv4Addr,
+    /// The allocation pool (inside the CIDR, excluding the gateway).
+    pub pool: IpPool,
+}
+
+impl Network {
+    /// Creates a network, validating the name, CIDR, gateway, and pool.
+    pub fn new(name: &str, cidr: &str, gateway: &str, pool: IpPool) -> Result<Self, ModelError> {
+        if name.trim().is_empty() {
+            return Err(ModelError::EmptyName);
+        }
+        let cidr: Ipv4Cidr = cidr.parse()?;
+        let gateway: Ipv4Addr = gateway
+            .parse()
+            .map_err(|_| ModelError::InvalidGateway(gateway.to_string()))?;
+        if u32::from(gateway) & cidr.mask() != u32::from(cidr.addr) {
+            return Err(ModelError::InvalidGateway(format!("{gateway} is outside {cidr}")));
+        }
+        if u32::from(pool.start) & cidr.mask() != u32::from(cidr.addr)
+            || u32::from(pool.end) & cidr.mask() != u32::from(cidr.addr)
+        {
+            return Err(ModelError::InvalidPool(format!(
+                "pool {}-{} is outside {cidr}",
+                pool.start, pool.end
+            )));
+        }
+        let gw = u32::from(gateway);
+        if (u32::from(pool.start)..=u32::from(pool.end)).contains(&gw) {
+            return Err(ModelError::InvalidPool(format!(
+                "pool {}-{} contains gateway {gateway}",
+                pool.start, pool.end
+            )));
+        }
+        Ok(Network {
+            name: name.to_string(),
+            cidr,
+            gateway,
+            pool,
+        })
+    }
+}
+
+/// A 48-bit Ethernet MAC address (spec REQ-003).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct MacAddr([u8; 6]);
+
+impl FromStr for MacAddr {
+    type Err = ModelError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let parts: Vec<&str> = s.split(':').collect();
+        if parts.len() != 6 {
+            return Err(ModelError::InvalidMac(s.to_string()));
+        }
+        let mut octets = [0u8; 6];
+        for (i, part) in parts.iter().enumerate() {
+            if part.len() != 2 {
+                return Err(ModelError::InvalidMac(s.to_string()));
+            }
+            octets[i] = u8::from_str_radix(part, 16).map_err(|_| ModelError::InvalidMac(s.to_string()))?;
+        }
+        Ok(MacAddr(octets))
+    }
+}
+
+impl fmt::Display for MacAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            self.0[0], self.0[1], self.0[2], self.0[3], self.0[4], self.0[5]
+        )
+    }
+}
+
+/// A vhost-user backend endpoint that can be attached to a network (spec REQ-003).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Port {
+    /// The port name.
+    pub name: String,
+    /// The listening Unix socket path.
+    pub socket_path: PathBuf,
+    /// The attached network name, if any.
+    pub network: Option<String>,
+    /// The attached MAC address, if any.
+    pub mac: Option<MacAddr>,
+    /// The attached IP address, if any.
+    pub ip: Option<Ipv4Addr>,
+}
+
+impl Port {
+    /// Creates a detached port; rejects empty or whitespace-only names.
+    pub fn new(name: &str, socket_path: impl Into<PathBuf>) -> Result<Self, ModelError> {
+        if name.trim().is_empty() {
+            return Err(ModelError::EmptyName);
+        }
+        Ok(Port {
+            name: name.to_string(),
+            socket_path: socket_path.into(),
+            network: None,
+            mac: None,
+            ip: None,
+        })
+    }
+
+    /// Attaches the port to a network with a MAC and IP binding.
+    pub fn attach(&mut self, network: &str, mac: MacAddr, ip: Ipv4Addr) {
+        self.network = Some(network.to_string());
+        self.mac = Some(mac);
+        self.ip = Some(ip);
+    }
+
+    /// Detaches the port; the socket path is kept alive.
+    pub fn detach(&mut self) {
+        self.network = None;
+        self.mac = None;
+        self.ip = None;
+    }
+}
+
+/// An IPAM allocation record binding a MAC address to an IP on a network (spec REQ-004).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Allocation {
+    /// The network name.
+    pub network: String,
+    /// The bound MAC address.
+    pub mac: MacAddr,
+    /// The allocated IP address.
+    pub ip: Ipv4Addr,
+}
+
+/// A DHCP lease record (spec REQ-005).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DhcpLease {
+    /// The leased MAC address.
+    pub mac: MacAddr,
+    /// The leased IP address.
+    pub ip: Ipv4Addr,
+    /// The lease duration in seconds.
+    pub lease_seconds: u64,
+}
+
+/// The persisted daemon state: networks, ports, allocations, and leases (spec REQ-010).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct State {
+    /// Networks keyed by name.
+    pub networks: HashMap<String, Network>,
+    /// Ports keyed by name.
+    pub ports: HashMap<String, Port>,
+    /// IPAM allocation records.
+    pub allocations: Vec<Allocation>,
+    /// DHCP lease records.
+    pub leases: Vec<DhcpLease>,
+}
+
 #[cfg(test)]
 mod tests {
     // Expected API — implemented by TASK-003 to satisfy these tests:
