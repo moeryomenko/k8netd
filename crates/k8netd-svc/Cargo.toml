@@ -1,0 +1,10 @@
+[package]
+name = "k8netd-svc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Network services (DHCP, DNS, per-port passt WAN) for k8netd"
+
+[dependencies]
+dhcproto = "0.15.0"
+hickory-proto = "0.26.1"

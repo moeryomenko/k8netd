@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/k8netd",
+    "crates/k8netd-core",
+    "crates/k8netd-rpc",
+    "crates/k8netd-svc",
+    "crates/k8netd-vhost",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"

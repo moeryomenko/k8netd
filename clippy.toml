@@ -1,0 +1,4 @@
+# Clippy configuration for the workspace. msrv mirrors the
+# rust-toolchain.toml pin so MSRV-aware lints stay honest. The 120-column
+# limit is enforced by rustfmt.toml, not clippy.
+msrv = "1.97.1"

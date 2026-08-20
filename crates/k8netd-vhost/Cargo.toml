@@ -1,0 +1,11 @@
+[package]
+name = "k8netd-vhost"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "vhost-user backend ports for the k8netd L2 switch"
+
+[dependencies]
+vhost = "0.17.0"
+vhost-user-backend = "0.23.0"
+vm-memory = "0.18.0"

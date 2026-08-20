@@ -1,0 +1,10 @@
+[package]
+name = "k8netd-rpc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Control-plane JSON-RPC 2.0 protocol and handlers for k8netd"
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"

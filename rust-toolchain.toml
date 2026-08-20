@@ -1,0 +1,7 @@
+# Pin the stable toolchain for the whole workspace (plan Notes for @build:
+# "Rust toolchain pinned in rust-toolchain.toml"). rustup installs this
+# channel on first use; components are limited to what the CI gate needs.
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

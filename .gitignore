@@ -1,0 +1,7 @@
+# Build artifacts
+/target
+
+# Workspace artifacts (evidence/spec/plan dirs are gitignored per the
+# cluster-api-hypervisor convention)
+/.plans/
+/.agent/

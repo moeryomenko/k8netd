@@ -1,0 +1,15 @@
+[package]
+name = "k8netd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Rootless userspace vhost-user L2 switch for cloud-hypervisor VMs"
+
+[dependencies]
+k8netd-core = { path = "../k8netd-core" }
+k8netd-rpc = { path = "../k8netd-rpc" }
+k8netd-svc = { path = "../k8netd-svc" }
+k8netd-vhost = { path = "../k8netd-vhost" }
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "net", "io-util", "sync", "time", "signal"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
