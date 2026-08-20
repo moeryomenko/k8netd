@@ -7,6 +7,233 @@
 //! tests pass; the tests module stays at the bottom of the file per Rust
 //! convention.
 
+use std::collections::HashMap;
+use std::net::Ipv4Addr;
+
+use crate::model::{Ipv4Cidr, Network};
+use crate::switch::frame::ParsedFrame;
+use crate::switch::mac_table::PortId;
+
+/// Ethernet ethertype: ARP (RFC 826).
+const ETHERTYPE_ARP: u16 = 0x0806;
+/// Ethernet ethertype: IPv4.
+const ETHERTYPE_IPV4: u16 = 0x0800;
+/// Length of the untagged ethernet header in bytes.
+const ETH_HEADER_LEN: usize = 14;
+/// Length of a standard IPv4-over-Ethernet ARP payload in bytes.
+const ARP_LEN: usize = 28;
+/// Minimum length of an IPv4 header (IHL 5, no options) in bytes.
+const IPV4_MIN_HEADER_LEN: usize = 20;
+/// Minimum IPv4 IHL (header length, in 32-bit words).
+const IPV4_MIN_IHL: usize = 5;
+/// Size of one IPv4 IHL unit in bytes.
+const IPV4_IHL_UNIT: usize = 4;
+
+/// The gateway function: per-network ARP responder and per-port egress
+/// classifier (spec REQ-007).
+///
+/// The gateway is per-network: each configured [`Network`] contributes its
+/// gateway address (for ARP) and its CIDR (for local/non-local
+/// classification), and each attached port is bound to exactly one network
+/// name. `handle_frame` is stateless per frame (`&self`, no I/O): it drives
+/// the existing [`ParsedFrame::parse`] and the network configuration. It
+/// never produces a frame for any port other than the ingress: [`Wan`]
+/// egress is always the ingress port's own passt WAN output and
+/// [`ArpReply`] is delivered to the ingress port. There is no shared WAN
+/// output and no inbound L3 routing path (spec REQ-007: "No inbound L3
+/// routing"; per-VM passt handles inbound deterministically).
+#[derive(Debug)]
+pub struct Gateway {
+    /// Configured networks keyed by name.
+    networks: HashMap<String, Network>,
+    /// Attached ports keyed by handle, mapped to their network name.
+    ports: HashMap<PortId, String>,
+}
+
+impl Gateway {
+    /// Creates an empty gateway with no networks and no ports.
+    pub fn new() -> Gateway {
+        Gateway {
+            networks: HashMap::new(),
+            ports: HashMap::new(),
+        }
+    }
+
+    /// Adds `network` to the gateway, keyed by its name.
+    ///
+    /// Re-adding a network with the same name replaces the existing entry.
+    pub fn add_network(&mut self, network: &Network) {
+        self.networks.insert(network.name.clone(), network.clone());
+    }
+
+    /// Removes the network named `name`; returns true when it was configured.
+    pub fn remove_network(&mut self, name: &str) -> bool {
+        self.networks.remove(name).is_some()
+    }
+
+    /// Attaches `port` to the network named `network`.
+    ///
+    /// Re-attaching an existing port replaces its network binding.
+    pub fn add_port(&mut self, port: PortId, network: &str) {
+        self.ports.insert(port, network.to_string());
+    }
+
+    /// Detaches `port`; returns true when the port was attached.
+    pub fn remove_port(&mut self, port: PortId) -> bool {
+        self.ports.remove(&port).is_some()
+    }
+
+    /// Classifies `frame` arriving at `ingress`, returning the gateway action.
+    ///
+    /// The ingress port's network (from the port map) selects both the
+    /// gateway address (ARP) and the CIDR (local/non-local classification).
+    /// Frames at unattached ports, at ports whose network is not configured,
+    /// and unparseable frames are [`L2`]: the switch's L2 behavior applies
+    /// and the gateway never touches the WAN.
+    pub fn handle_frame<'a>(&self, ingress: PortId, frame: &'a [u8]) -> GatewayAction<'a> {
+        let Some(network_name) = self.ports.get(&ingress) else {
+            return GatewayAction::L2;
+        };
+        let Some(network) = self.networks.get(network_name) else {
+            return GatewayAction::L2;
+        };
+        let Ok(parsed) = ParsedFrame::parse(frame) else {
+            return GatewayAction::L2;
+        };
+        match parsed.ethertype {
+            ETHERTYPE_ARP => arp_response(network, &parsed),
+            ETHERTYPE_IPV4 => ipv4_egress(network, &parsed, frame),
+            _ => GatewayAction::L2,
+        }
+    }
+}
+
+impl Default for Gateway {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Answers an ARP request for `network`'s gateway address.
+///
+/// Exactly one frame class is answered: an ARP request (op 1) of a standard
+/// IPv4-over-Ethernet ARP (htype 1, ptype 0x0800, hlen 6, plen 4, at least
+/// 28 payload bytes) whose target protocol address equals the network's
+/// gateway. The L2 destination of the request (broadcast or unicast) does
+/// not matter. The reply is unicast to the requester; ARP replies (op 2)
+/// and requests for any other address are not answered.
+fn arp_response<'p>(network: &Network, parsed: &ParsedFrame<'p>) -> GatewayAction<'p> {
+    let payload = parsed.payload;
+    if !is_ipv4_over_ethernet_arp_request(payload) {
+        return GatewayAction::L2;
+    }
+    let tpa = Ipv4Addr::from([payload[24], payload[25], payload[26], payload[27]]);
+    if tpa != network.gateway {
+        return GatewayAction::L2;
+    }
+    GatewayAction::ArpReply(build_arp_reply(payload, network.gateway))
+}
+
+/// Classifies an IPv4 frame as local or non-local for `network`.
+///
+/// A destination IP outside the network's CIDR is egressed byte-identical to
+/// the ingress port's own passt WAN output ([`Wan`]); a destination inside
+/// the CIDR — including the gateway IP itself — is [`L2`], so VM-to-VM and
+/// VM-to-gateway traffic bypasses the WAN. An invalid IPv4 header (payload
+/// shorter than IHL*4, IHL < 5, or IP version != 4) is dropped for egress:
+/// [`L2`].
+fn ipv4_egress<'p>(network: &Network, parsed: &ParsedFrame<'p>, frame: &'p [u8]) -> GatewayAction<'p> {
+    let payload = parsed.payload;
+    if !is_valid_ipv4_header(payload) {
+        return GatewayAction::L2;
+    }
+    let dst = Ipv4Addr::from([payload[16], payload[17], payload[18], payload[19]]);
+    if in_cidr(dst, &network.cidr) {
+        GatewayAction::L2
+    } else {
+        GatewayAction::Wan(frame)
+    }
+}
+
+/// The gateway action for one ingress frame (spec REQ-007).
+///
+/// The action names the dataplane output, never a port: [`Wan`] is always
+/// the ingress port's own passt WAN output and [`ArpReply`] is delivered to
+/// the ingress port (the requester).
+#[derive(Debug)]
+pub enum GatewayAction<'a> {
+    /// L2 only: no gateway action; the switch forwards/floods as usual.
+    L2,
+    /// Egress: write the frame (byte-identical to the input) to the ingress
+    /// port's own passt WAN output.
+    Wan(&'a [u8]),
+    /// ARP reply: deliver the constructed reply frame to the ingress port
+    /// (the requester).
+    ArpReply(Vec<u8>),
+}
+
+/// Returns true when `payload` is a standard IPv4-over-Ethernet ARP request:
+/// at least 28 bytes, htype 1, ptype 0x0800, hlen 6, plen 4, op 1.
+fn is_ipv4_over_ethernet_arp_request(payload: &[u8]) -> bool {
+    payload.len() >= ARP_LEN
+        && u16::from_be_bytes([payload[0], payload[1]]) == 1 // htype: Ethernet
+        && u16::from_be_bytes([payload[2], payload[3]]) == 0x0800 // ptype: IPv4
+        && payload[4] == 6 // hlen
+        && payload[5] == 4 // plen
+        && u16::from_be_bytes([payload[6], payload[7]]) == 1 // op: request
+}
+
+/// Returns true when `payload` holds a valid IPv4 header: at least IHL*4
+/// bytes, IHL >= 5, and IP version 4.
+fn is_valid_ipv4_header(payload: &[u8]) -> bool {
+    if payload.len() < IPV4_MIN_HEADER_LEN {
+        return false;
+    }
+    let first = payload[0];
+    let version = first >> 4;
+    let ihl = (first & 0x0f) as usize;
+    version == 4 && ihl >= IPV4_MIN_IHL && payload.len() >= ihl * IPV4_IHL_UNIT
+}
+
+/// Returns true when `ip` is inside `cidr`.
+fn in_cidr(ip: Ipv4Addr, cidr: &Ipv4Cidr) -> bool {
+    let mask = if cidr.prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - cidr.prefix)
+    };
+    u32::from(ip) & mask == u32::from(cidr.addr)
+}
+
+/// Derives the gateway MAC from the gateway IP: 02:00:<o1>:<o2>:<o3>:<o4>
+/// (locally administered, stable per gateway IP, unique per address).
+fn gateway_mac(gateway: Ipv4Addr) -> [u8; 6] {
+    let octets = gateway.octets();
+    [0x02, 0x00, octets[0], octets[1], octets[2], octets[3]]
+}
+
+/// Builds the 42-byte ARP reply to a 28-byte ARP request payload: op 2,
+/// unicast to the requester (dst = the request's sha), src = sha = the
+/// gateway MAC, spa = the gateway IP, tha = the requester's MAC, tpa = the
+/// requester's IP.
+fn build_arp_reply(request: &[u8], gateway: Ipv4Addr) -> Vec<u8> {
+    let gw_mac = gateway_mac(gateway);
+    let mut reply = Vec::with_capacity(ETH_HEADER_LEN + ARP_LEN);
+    reply.extend_from_slice(&request[8..14]); // dst MAC: the request's sha
+    reply.extend_from_slice(&gw_mac); // src MAC: the gateway
+    reply.extend_from_slice(&ETHERTYPE_ARP.to_be_bytes());
+    reply.extend_from_slice(&1u16.to_be_bytes()); // htype: Ethernet
+    reply.extend_from_slice(&0x0800u16.to_be_bytes()); // ptype: IPv4
+    reply.push(6); // hlen
+    reply.push(4); // plen
+    reply.extend_from_slice(&2u16.to_be_bytes()); // op: reply
+    reply.extend_from_slice(&gw_mac); // sha: the gateway
+    reply.extend_from_slice(&gateway.octets()); // spa: the gateway IP
+    reply.extend_from_slice(&request[8..14]); // tha: the requester's MAC
+    reply.extend_from_slice(&request[14..18]); // tpa: the requester's IP
+    reply
+}
+
 #[cfg(test)]
 mod tests {
     // Expected API — implemented by TASK-013 to satisfy these tests:
