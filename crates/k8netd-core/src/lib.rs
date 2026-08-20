@@ -6,3 +6,4 @@
 
 pub mod ipam;
 pub mod model;
+pub mod switch;
