@@ -4,4 +4,5 @@
 //! persisted state store used by the vhost-user dataplane and the JSON-RPC
 //! control plane (spec REQ-002..REQ-007, REQ-010).
 
+pub mod ipam;
 pub mod model;
