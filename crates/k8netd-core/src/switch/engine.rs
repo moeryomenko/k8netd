@@ -6,6 +6,143 @@
 //! make the tests pass; the tests module stays at the bottom of the file per
 //! Rust convention.
 
+use std::collections::HashMap;
+
+use crate::model::MacAddr;
+use crate::switch::frame::ParsedFrame;
+use crate::switch::mac_table::{MacTable, PortId};
+
+/// Upper bound on learned MAC entries.
+///
+/// The spec pins no table size; a lab switch sees at most one MAC per VM
+/// plus a handful of service MACs, so 1024 entries is generous. Beyond the
+/// bound, eviction is the table's recency-based (LRU) policy.
+const MAC_TABLE_CAPACITY: usize = 1024;
+
+/// An L2 forwarding/flooding engine: MAC learning, known-unicast forwarding,
+/// and unknown-unicast/broadcast/multicast flooding per network (spec REQ-007).
+///
+/// The engine is synchronous with no I/O. `forward` learns the source MAC of
+/// every valid frame arriving at a live port, then classifies the
+/// destination: a set I-bit (bit 0 of the first destination octet) marks the
+/// destination as broadcast or multicast and always floods, ignoring any
+/// table entry; a known unicast is delivered only to the learned port when
+/// that port is live on the same network as the ingress; an unknown unicast
+/// floods to every other port on the ingress's network. Frames are never
+/// modified, never echoed back to the ingress port, and never cross
+/// networks.
+#[derive(Debug)]
+pub struct Switch {
+    /// Live ports keyed by handle, mapped to their network name.
+    ports: HashMap<PortId, String>,
+    /// The MAC learning table (recency-based LRU).
+    table: MacTable,
+}
+
+impl Switch {
+    /// Creates an empty switch with no ports and an empty MAC table.
+    pub fn new() -> Switch {
+        Switch {
+            ports: HashMap::new(),
+            table: MacTable::new(MAC_TABLE_CAPACITY),
+        }
+    }
+
+    /// Adds `port` to the switch on the network named `network`.
+    ///
+    /// Re-adding an existing port replaces its network attachment.
+    pub fn add_port(&mut self, port: PortId, network: &str) {
+        self.ports.insert(port, network.to_string());
+    }
+
+    /// Removes `port` from the switch; returns true when the port was live.
+    ///
+    /// A removed port stops sending and receiving. MAC entries learned on it
+    /// are kept: a stale entry resolves to a dead port and drops the frame
+    /// rather than flooding (eviction is the table's LRU policy, not
+    /// removal's).
+    pub fn remove_port(&mut self, port: PortId) -> bool {
+        self.ports.remove(&port).is_some()
+    }
+
+    /// Forwards `frame` arriving at `ingress`, returning the per-port egress.
+    ///
+    /// Returns one `(port, frame)` pair per output port, where the frame is
+    /// the unchanged input bytes (an L2 switch never modifies frames).
+    ///
+    /// Behavior: the source MAC is learned before the frame is forwarded or
+    /// flooded; broadcast/multicast destinations (a set I-bit) always flood,
+    /// ignoring any table entry; a known unicast is delivered only to the
+    /// learned port when that port is live on the same network as the ingress
+    /// (a destination learned on another network is unknown within the
+    /// ingress's network and floods there); an unknown unicast floods to
+    /// every other port on the ingress's network. Frames at ports that were
+    /// never added or were removed, and unparseable frames, are dropped
+    /// without learning.
+    pub fn forward<'a>(&mut self, ingress: PortId, frame: &'a [u8]) -> Vec<(PortId, &'a [u8])> {
+        let network = match self.ports.get(&ingress) {
+            Some(network) => network,
+            None => return Vec::new(),
+        };
+        let parsed = match ParsedFrame::parse(frame) {
+            Ok(parsed) => parsed,
+            Err(_) => return Vec::new(),
+        };
+        // Learn-then-forward: the source MAC is learned before any lookup.
+        self.table.learn(ingress, parsed.src);
+        let egress = if is_local_unicast(frame) {
+            self.unicast_egress(network, ingress, parsed.dst)
+        } else {
+            self.flood_set(network, ingress)
+        };
+        egress.iter().copied().map(|port| (port, frame)).collect()
+    }
+
+    /// The egress for a unicast destination arriving on `network`.
+    ///
+    /// A learned destination is delivered only to its port when that port is
+    /// live on the same network; a destination learned on another network is
+    /// unknown within `network` and floods there; a destination that resolves
+    /// to the ingress port (no echo) or to a removed port (stale entry) is
+    /// dropped.
+    fn unicast_egress(&self, network: &str, ingress: PortId, dst: MacAddr) -> Vec<PortId> {
+        match self.table.lookup(dst) {
+            Some(port) if port == ingress => Vec::new(),
+            Some(port) => match self.ports.get(&port) {
+                None => Vec::new(),
+                Some(target) if target == network => vec![port],
+                Some(_) => self.flood_set(network, ingress),
+            },
+            None => self.flood_set(network, ingress),
+        }
+    }
+
+    /// Every live port on `network` except `exclude`.
+    ///
+    /// Membership is by port attachment, not by learned MAC: a port that
+    /// never transmitted is still a flood destination.
+    fn flood_set(&self, network: &str, exclude: PortId) -> Vec<PortId> {
+        self.ports
+            .iter()
+            .filter(|(port, attached)| **port != exclude && attached.as_str() == network)
+            .map(|(port, _)| *port)
+            .collect()
+    }
+}
+
+impl Default for Switch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Returns true when the destination MAC is a local unicast: the I-bit (bit
+/// 0 of the first destination octet) is clear. A set I-bit marks the
+/// destination as broadcast or multicast.
+fn is_local_unicast(frame: &[u8]) -> bool {
+    frame[0] & 0x01 == 0
+}
+
 #[cfg(test)]
 mod tests {
     // Expected API — implemented by TASK-011 to satisfy these tests:
