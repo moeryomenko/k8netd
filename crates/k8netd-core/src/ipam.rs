@@ -6,6 +6,91 @@
 //! make the tests pass; the tests module stays at the bottom of the file per
 //! Rust convention.
 
+use std::collections::HashMap;
+use std::fmt;
+use std::net::Ipv4Addr;
+
+use crate::model::{MacAddr, Network};
+
+/// Error type for IPAM allocation failures (spec REQ-004).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IpamError {
+    /// Every address in the pool is already bound to a MAC.
+    PoolExhausted,
+    /// `release()` was called for a MAC with no active allocation.
+    UnknownMac,
+}
+
+impl fmt::Display for IpamError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            IpamError::PoolExhausted => write!(f, "IP pool exhausted"),
+            IpamError::UnknownMac => write!(f, "no allocation for the given MAC"),
+        }
+    }
+}
+
+impl std::error::Error for IpamError {}
+
+/// In-memory IPAM allocator for one network (spec REQ-004).
+///
+/// Allocates the lowest free address in the network's pool and binds it to a
+/// MAC as a DHCP reservation; the same MAC always receives the same IP while
+/// its allocation is active. The gateway is never allocated because
+/// `Network::new` rejects pools that contain it.
+#[derive(Debug)]
+pub struct Ipam {
+    network: Network,
+    allocations: HashMap<MacAddr, Ipv4Addr>,
+}
+
+impl Ipam {
+    /// Creates an allocator for the given network with no active allocations.
+    pub fn new(network: Network) -> Self {
+        Ipam {
+            network,
+            allocations: HashMap::new(),
+        }
+    }
+
+    /// Allocates the lowest free address in the pool and binds it to `mac`.
+    ///
+    /// Returns the existing binding when `mac` already has an allocation
+    /// (reservation semantics), or `Err(IpamError::PoolExhausted)` when every
+    /// pool address is bound.
+    pub fn allocate(&mut self, mac: MacAddr) -> Result<Ipv4Addr, IpamError> {
+        if let Some(ip) = self.allocations.get(&mac) {
+            return Ok(*ip);
+        }
+        let start = u32::from(self.network.pool.start);
+        let end = u32::from(self.network.pool.end);
+        for candidate in start..=end {
+            let ip = Ipv4Addr::from(candidate);
+            if !self.allocations.values().any(|bound| *bound == ip) {
+                self.allocations.insert(mac, ip);
+                return Ok(ip);
+            }
+        }
+        Err(IpamError::PoolExhausted)
+    }
+
+    /// Frees the IP bound to `mac` for reuse.
+    ///
+    /// Returns `Err(IpamError::UnknownMac)` when `mac` has no active
+    /// allocation.
+    pub fn release(&mut self, mac: MacAddr) -> Result<(), IpamError> {
+        if self.allocations.remove(&mac).is_none() {
+            return Err(IpamError::UnknownMac);
+        }
+        Ok(())
+    }
+
+    /// Returns the IP bound to `mac`, if any.
+    pub fn lookup(&self, mac: MacAddr) -> Option<Ipv4Addr> {
+        self.allocations.get(&mac).copied()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // Expected API — implemented by TASK-007 to satisfy these tests:
