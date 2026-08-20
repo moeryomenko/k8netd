@@ -164,6 +164,13 @@ impl Network {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MacAddr([u8; 6]);
 
+impl MacAddr {
+    /// Creates a MAC address from its six octets.
+    pub const fn from_bytes(bytes: [u8; 6]) -> Self {
+        MacAddr(bytes)
+    }
+}
+
 impl FromStr for MacAddr {
     type Err = ModelError;
 

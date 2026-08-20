@@ -5,6 +5,107 @@
 //! (red phase). TASK-009 implements the table in this file to make the tests
 //! pass; the tests module stays at the bottom of the file per Rust convention.
 
+use std::collections::HashMap;
+use std::fmt;
+
+use crate::model::MacAddr;
+
+/// An opaque port handle identifying a switch port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PortId(pub u32);
+
+impl fmt::Display for PortId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "port {}", self.0)
+    }
+}
+
+/// A MAC learning table with recency-based (LRU) eviction.
+///
+/// Aging is recency-based, not wall-clock: re-learning an existing MAC
+/// refreshes its recency, and when the table is at capacity learning a new
+/// MAC evicts the least-recently-used entry. The table never grows beyond
+/// `capacity`, stores whatever MAC it is given (including the zero MAC), and
+/// learning into a zero-capacity table is a silent no-op.
+#[derive(Debug)]
+pub struct MacTable {
+    capacity: usize,
+    clock: u64,
+    entries: HashMap<MacAddr, Entry>,
+}
+
+/// A table entry: the learned port and its recency stamp.
+#[derive(Debug, Clone, Copy)]
+struct Entry {
+    port: PortId,
+    last_seen: u64,
+}
+
+impl MacTable {
+    /// Creates an empty table that holds at most `capacity` entries.
+    pub fn new(capacity: usize) -> MacTable {
+        MacTable {
+            capacity,
+            clock: 0,
+            entries: HashMap::new(),
+        }
+    }
+
+    /// Learns or refreshes the mapping from `mac` to `port`.
+    ///
+    /// Re-learning an existing MAC updates its port and refreshes its
+    /// recency. When the table is at capacity, the least-recently-used entry
+    /// is evicted. Learning into a zero-capacity table is a silent no-op.
+    pub fn learn(&mut self, port: PortId, mac: MacAddr) {
+        if self.capacity == 0 {
+            return;
+        }
+        self.clock = self.clock.wrapping_add(1);
+        if let Some(entry) = self.entries.get_mut(&mac) {
+            entry.port = port;
+            entry.last_seen = self.clock;
+            return;
+        }
+        if self.entries.len() == self.capacity {
+            let lru = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_seen)
+                .map(|(mac, _)| *mac);
+            if let Some(lru) = lru {
+                self.entries.remove(&lru);
+            }
+        }
+        self.entries.insert(
+            mac,
+            Entry {
+                port,
+                last_seen: self.clock,
+            },
+        );
+    }
+
+    /// Returns the port that `mac` was last learned on, if any.
+    pub fn lookup(&self, mac: MacAddr) -> Option<PortId> {
+        self.entries.get(&mac).map(|entry| entry.port)
+    }
+
+    /// Removes the entry for `mac`; returns true when an entry existed.
+    pub fn evict(&mut self, mac: MacAddr) -> bool {
+        self.entries.remove(&mac).is_some()
+    }
+
+    /// Returns the number of learned entries.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns true when no MAC has been learned.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // Expected API — implemented by TASK-009 to satisfy these tests:

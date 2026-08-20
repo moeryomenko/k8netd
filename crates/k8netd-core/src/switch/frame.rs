@@ -6,6 +6,85 @@
 //! the tests pass; the tests module stays at the bottom of the file per Rust
 //! convention.
 
+use std::fmt;
+
+use crate::model::MacAddr;
+
+/// Error type for ethernet frame parsing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameError {
+    /// The frame is shorter than the 14-byte ethernet header (18 bytes when
+    /// the 802.1Q tag is present).
+    TooShort { len: usize },
+}
+
+impl fmt::Display for FrameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FrameError::TooShort { len } => write!(f, "ethernet frame too short: {len} bytes"),
+        }
+    }
+}
+
+impl std::error::Error for FrameError {}
+
+/// A parsed ethernet frame: header fields plus a payload slice.
+///
+/// The payload borrows the input buffer, so parsing allocates nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParsedFrame<'a> {
+    /// Destination MAC address (6 bytes at offset 0).
+    pub dst: MacAddr,
+    /// Source MAC address (6 bytes at offset 6).
+    pub src: MacAddr,
+    /// Ethertype, big-endian at offset 12. For 802.1Q-tagged frames this is
+    /// the inner ethertype after the 4-byte tag.
+    pub ethertype: u16,
+    /// Payload bytes after the header: offset 14, or offset 18 when the
+    /// 802.1Q tag is present.
+    pub payload: &'a [u8],
+}
+
+impl<'a> ParsedFrame<'a> {
+    /// Parses an ethernet frame from raw bytes.
+    ///
+    /// Recognizes the 802.1Q TPID `0x8100` at the ethertype offset, skips the
+    /// 4-byte tag, and exposes the inner ethertype with the payload sliced
+    /// after the tag. Frames shorter than the 14-byte header — or shorter
+    /// than 18 bytes when tagged — are `FrameError::TooShort`. Unknown
+    /// ethertypes and the zero MAC parse successfully; rejecting them is the
+    /// forwarding engine's concern.
+    pub fn parse(frame: &'a [u8]) -> Result<ParsedFrame<'a>, FrameError> {
+        if frame.len() < 14 {
+            return Err(FrameError::TooShort { len: frame.len() });
+        }
+        let dst = mac_at(frame, 0);
+        let src = mac_at(frame, 6);
+        let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
+        let (ethertype, payload_offset) = if ethertype == 0x8100 {
+            if frame.len() < 18 {
+                return Err(FrameError::TooShort { len: frame.len() });
+            }
+            (u16::from_be_bytes([frame[16], frame[17]]), 18)
+        } else {
+            (ethertype, 14)
+        };
+        Ok(ParsedFrame {
+            dst,
+            src,
+            ethertype,
+            payload: &frame[payload_offset..],
+        })
+    }
+}
+
+/// Reads the 6-byte MAC address at `offset` without allocating.
+fn mac_at(frame: &[u8], offset: usize) -> MacAddr {
+    let mut bytes = [0u8; 6];
+    bytes.copy_from_slice(&frame[offset..offset + 6]);
+    MacAddr::from_bytes(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     // Expected API — implemented by TASK-009 to satisfy these tests:
@@ -79,7 +158,7 @@ mod tests {
         assert_eq!(parsed.ethertype, 0x0806);
         assert_eq!(parsed.payload.len(), 28);
         assert_eq!(parsed.payload[0..2], [0x00, 0x01]);
-        assert_eq!(parsed.payload[22..28], [0xc0, 0xa8, 0x7c, 0x01]);
+        assert_eq!(parsed.payload[24..28], [0xc0, 0xa8, 0x7c, 0x01]);
         // Payload is exactly the trailing bytes — never more, never less.
         assert_eq!(parsed.payload, &frame[14..]);
     }
