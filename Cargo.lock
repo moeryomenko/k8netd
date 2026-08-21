@@ -398,6 +398,7 @@ version = "0.1.0"
 dependencies = [
  "dhcproto",
  "hickory-proto",
+ "k8netd-core",
 ]
 
 [[package]]
