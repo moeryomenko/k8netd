@@ -53,6 +53,11 @@ impl Ipam {
         }
     }
 
+    /// Returns the network this allocator serves (pool, gateway, CIDR).
+    pub fn network(&self) -> &Network {
+        &self.network
+    }
+
     /// Allocates the lowest free address in the pool and binds it to `mac`.
     ///
     /// Returns the existing binding when `mac` already has an allocation

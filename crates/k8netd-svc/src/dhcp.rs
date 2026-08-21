@@ -6,6 +6,167 @@
 //! tests pass; the tests module stays at the bottom of the file per Rust
 //! convention.
 
+use std::net::Ipv4Addr;
+
+use dhcproto::v4::{Decodable, DhcpOption, Encodable, HType, MAGIC, Message, MessageType, Opcode, OptionCode};
+use k8netd_core::ipam::Ipam;
+use k8netd_core::model::MacAddr;
+
+/// Offset of the DHCPv4 magic cookie inside every packet (RFC 2131 section 4.1).
+const MAGIC_COOKIE_OFFSET: usize = 236;
+/// Smallest well-formed DHCPv4 packet: the 236-byte fixed header plus the magic cookie.
+const MIN_PACKET_SIZE: usize = MAGIC_COOKIE_OFFSET + 4;
+/// The `AddressLeaseTime` value delivered in OFFER and ACK, in seconds.
+const LEASE_SECONDS: u32 = 3600;
+
+/// DHCP server for one network (spec REQ-005, VC-04).
+///
+/// One server per network; the `Ipam` (and the `Network` it owns) is the
+/// source of the pool, the gateway, and the `AllocateIP` reservations. The
+/// server is a pure message handler (plan TASK-015 constraint): raw DHCP
+/// bytes in, raw reply bytes out; no I/O, no transport — the switch wires
+/// it up in TASK-031.
+///
+/// `handle` validates the magic cookie itself because `dhcproto` does not.
+#[derive(Debug)]
+pub struct DhcpServer {
+    ipam: Ipam,
+    /// The encoded reply produced by the last `handle` call, if any.
+    reply_buf: Vec<u8>,
+}
+
+impl DhcpServer {
+    /// Creates a server over the network owned by `ipam`.
+    pub fn new(ipam: Ipam) -> Self {
+        DhcpServer {
+            ipam,
+            reply_buf: Vec::new(),
+        }
+    }
+
+    /// Processes one raw DHCPv4 packet and returns the reply bytes, if any.
+    ///
+    /// The reply is owned by the server and valid until the next `handle`
+    /// call; the transport copies it to the wire before calling again.
+    ///
+    /// Returns `None` (no reply) when the packet is empty or truncated, the
+    /// magic cookie is wrong, the hardware type is not Ethernet or the
+    /// hardware length is not 6, or the message carries no `MessageType`
+    /// option. Message types other than Discover and Request (RELEASE,
+    /// INFORM, DECLINE, ...) are unanswered: the provider frees allocations
+    /// via the `ReleaseIP` RPC, so a guest RELEASE does not free the
+    /// binding. A Discover that cannot be honored (no reservation and an
+    /// exhausted pool) is also unanswered — RFC 2131 defines NAK only in
+    /// answer to a Request.
+    pub fn handle(&mut self, packet: &[u8]) -> Option<&[u8]> {
+        let encoded = self.process(packet)?;
+        self.reply_buf = encoded;
+        Some(&self.reply_buf)
+    }
+
+    /// Validates `packet` and builds the encoded reply, if any (see
+    /// [`handle`](Self::handle) for the no-reply conditions).
+    fn process(&mut self, packet: &[u8]) -> Option<Vec<u8>> {
+        if packet.len() < MIN_PACKET_SIZE || packet[MAGIC_COOKIE_OFFSET..MAGIC_COOKIE_OFFSET + 4] != MAGIC {
+            return None;
+        }
+        let msg = Message::from_bytes(packet).ok()?;
+        if msg.opcode() != Opcode::BootRequest || msg.htype() != HType::Eth || msg.hlen() != 6 {
+            return None;
+        }
+        let mac = MacAddr::from_bytes(msg.chaddr().try_into().ok()?);
+        match msg.opts().msg_type()? {
+            MessageType::Discover => self.discover(&msg, mac),
+            MessageType::Request => self.request(&msg, mac),
+            _ => None,
+        }
+    }
+
+    /// Answers a DISCOVER: a reserved MAC (an existing `Ipam` binding) is
+    /// offered its reserved IP; an unknown MAC is allocated the lowest free
+    /// pool address, which becomes its binding, so a retransmitted
+    /// DISCOVER re-offers the same IP. An exhausted pool yields no reply.
+    fn discover(&mut self, msg: &Message, mac: MacAddr) -> Option<Vec<u8>> {
+        let ip = match self.ipam.lookup(mac) {
+            Some(ip) => ip,
+            None => self.ipam.allocate(mac).ok()?,
+        };
+        self.reply(msg, ip, MessageType::Offer)
+    }
+
+    /// Answers a REQUEST: ACK iff the requested IP is bound to the
+    /// requesting MAC (`Ipam::lookup(chaddr) == Some(requested)`) — either
+    /// from a prior OFFER in this session or from a reservation that
+    /// survived a daemon restart. NAK otherwise (a missing
+    /// `RequestedIpAddress` option, an IP bound to a different MAC, an IP
+    /// outside the pool, or the gateway).
+    fn request(&mut self, msg: &Message, mac: MacAddr) -> Option<Vec<u8>> {
+        let requested = match msg.opts().get(OptionCode::RequestedIpAddress) {
+            Some(DhcpOption::RequestedIpAddress(ip)) => *ip,
+            _ => return self.nak(msg),
+        };
+        if self.ipam.lookup(mac) == Some(requested) {
+            self.reply(msg, requested, MessageType::Ack)
+        } else {
+            self.nak(msg)
+        }
+    }
+
+    /// Builds an OFFER or ACK: a BootReply with the echoed xid, chaddr, and
+    /// flags (broadcast bit), `yiaddr` set to the offered IP, and the
+    /// REQ-005 options: message type, server identifier (the gateway),
+    /// subnet mask (derived from the network CIDR prefix), router
+    /// (the gateway), DNS (the gateway), and lease time.
+    fn reply(&self, msg: &Message, ip: Ipv4Addr, mtype: MessageType) -> Option<Vec<u8>> {
+        let network = self.ipam.network();
+        let gateway = network.gateway;
+        let mut out = Message::new_with_id(
+            msg.xid(),
+            Ipv4Addr::UNSPECIFIED,
+            ip,
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::UNSPECIFIED,
+            msg.chaddr(),
+        );
+        out.set_opcode(Opcode::BootReply);
+        out.set_flags(msg.flags());
+        out.opts_mut().insert(DhcpOption::MessageType(mtype));
+        out.opts_mut().insert(DhcpOption::ServerIdentifier(gateway));
+        out.opts_mut()
+            .insert(DhcpOption::SubnetMask(netmask(network.cidr.prefix)));
+        out.opts_mut().insert(DhcpOption::Router(vec![gateway]));
+        out.opts_mut().insert(DhcpOption::DomainNameServer(vec![gateway]));
+        out.opts_mut().insert(DhcpOption::AddressLeaseTime(LEASE_SECONDS));
+        out.to_vec().ok()
+    }
+
+    /// Builds a NAK: a BootReply with the echoed xid and chaddr, `yiaddr`
+    /// 0.0.0.0, and only the `MessageType(Nak)` option.
+    fn nak(&self, msg: &Message) -> Option<Vec<u8>> {
+        let mut out = Message::new_with_id(
+            msg.xid(),
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::UNSPECIFIED,
+            msg.chaddr(),
+        );
+        out.set_opcode(Opcode::BootReply);
+        out.set_flags(msg.flags());
+        out.opts_mut().insert(DhcpOption::MessageType(MessageType::Nak));
+        out.to_vec().ok()
+    }
+}
+
+/// Returns the 32-bit network mask for a CIDR prefix length.
+fn netmask(prefix: u8) -> Ipv4Addr {
+    if prefix == 0 {
+        Ipv4Addr::UNSPECIFIED
+    } else {
+        Ipv4Addr::from(u32::MAX << (32 - prefix))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // Expected API — implemented by TASK-015 to satisfy these tests:
