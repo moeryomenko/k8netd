@@ -13,6 +13,115 @@
 //! per-upstream timeout) is TASK-017/TASK-031; the test seam is the
 //! `UpstreamSender` trait pinned in the tests module doc comment.
 
+use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
+
+/// A failed attempt against one upstream (pinned by the TASK-016 test seam).
+///
+/// The production sender (TASK-017/TASK-031) maps its transport failures to
+/// these variants; `Timeout` is the per-upstream timeout the trait doc pins.
+#[derive(Debug)]
+pub enum UpstreamError {
+    /// The upstream did not answer within the per-upstream timeout (the
+    /// production sender must enforce one and never block indefinitely).
+    Timeout,
+    /// The upstream refused the query.
+    Refused,
+    /// Transport-level send/recv failure.
+    Io(std::io::Error),
+}
+
+impl Clone for UpstreamError {
+    /// Clones the error. `std::io::Error` is not `Clone`, so the `Io`
+    /// variant's clone preserves the error's kind and message.
+    fn clone(&self) -> Self {
+        match self {
+            UpstreamError::Timeout => UpstreamError::Timeout,
+            UpstreamError::Refused => UpstreamError::Refused,
+            UpstreamError::Io(err) => UpstreamError::Io(std::io::Error::new(err.kind(), err.to_string())),
+        }
+    }
+}
+
+/// Test seam (TASK-016 design note): a pluggable upstream sender so the
+/// forwarder is testable without real UDP. The production implementation
+/// (TASK-017/TASK-031) sends the query over UDP to the pinned upstream's
+/// `:53` and returns the response bytes.
+///
+/// Object-safe: the forwarder holds `Vec<Box<dyn UpstreamSender>>`.
+pub trait UpstreamSender: Send + Sync + 'static {
+    /// Sends one raw DNS query to the upstream and returns the raw response
+    /// bytes, or an [`UpstreamError`] when the attempt failed.
+    fn send(&self, query: &[u8]) -> Result<Vec<u8>, UpstreamError>;
+}
+
+/// A pure DNS forwarder (spec REQ-006, VC-05): no local zones, no caching,
+/// stateless per query.
+///
+/// The forwarder holds its upstreams as trait objects in try order; the
+/// switch wires it up in TASK-031.
+pub struct DnsForwarder {
+    upstreams: Vec<Box<dyn UpstreamSender>>,
+}
+
+impl DnsForwarder {
+    /// Creates a forwarder over the given upstreams, in try order.
+    ///
+    /// An empty list is accepted: every query then gets SERVFAIL.
+    pub fn new(upstreams: Vec<Box<dyn UpstreamSender>>) -> Self {
+        DnsForwarder { upstreams }
+    }
+
+    /// Forwards one raw DNS query and returns the response bytes to relay to
+    /// the requester, or `None` (drop, no response) when the packet is
+    /// undecodable or carries no questions.
+    ///
+    /// Pinned behavior:
+    /// - the query is relayed byte-for-byte to the upstreams, one at a time
+    ///   in list order (sequential); header flags such as TC are not
+    ///   interpreted
+    /// - the first response that decodes, has message_type `Response`, and
+    ///   echoes the query's ID is relayed back byte-for-byte (same ID, same
+    ///   answers); a response that fails those checks (undecodable,
+    ///   mismatched ID, not a response) is a failed attempt: the next
+    ///   upstream is tried
+    /// - if every attempt fails (Timeout/Refused/Io, or only bad responses),
+    ///   a SERVFAIL response is built and returned: the query's ID echoed,
+    ///   opcode Query, message_type Response, rcode ServFail, empty
+    ///   question/answer/authority/additional sections — never a hang,
+    ///   never a panic
+    /// - `handle` takes `&self`: the forwarder holds no state per query; a
+    ///   failed query does not affect the next one
+    pub fn handle(&self, packet: &[u8]) -> Option<Vec<u8>> {
+        // The forwarder must decode to forward: garbage is dropped, never
+        // forwarded, never a panic. The raw bytes are what gets relayed
+        // (byte-for-byte), so only the ID and the question count come off
+        // the decode.
+        let query = Message::from_vec(packet).ok()?;
+        if query.queries.is_empty() {
+            return None;
+        }
+        let id = query.metadata.id;
+        for upstream in &self.upstreams {
+            if let Ok(response) = upstream.send(packet)
+                && let Ok(decoded) = Message::from_vec(&response)
+                && decoded.metadata.message_type == MessageType::Response
+                && decoded.metadata.id == id
+            {
+                return Some(response);
+            }
+        }
+        Self::servfail(id)
+    }
+
+    /// Builds the SERVFAIL sent when every upstream attempt fails: the
+    /// query's ID echoed, opcode Query, rcode ServFail, empty sections.
+    fn servfail(id: u16) -> Option<Vec<u8>> {
+        Message::error_msg(id, OpCode::Query, ResponseCode::ServFail)
+            .to_vec()
+            .ok()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // Expected API — implemented by TASK-017 to satisfy these tests:
@@ -244,7 +353,7 @@ mod tests {
         assert_eq!(msg.metadata.response_code, ResponseCode::NoError);
         assert_eq!(msg.answers.len(), 2, "same answers");
         let a = &msg.answers[0];
-        assert_eq!(a.name, name(QUERY_NAME));
+        assert_eq!(a.name, name("upstream.example."));
         assert_eq!(a.dns_class, DNSClass::IN);
         assert_eq!(a.ttl, TTL);
         assert_eq!(a.data, RData::A(A::from(A_IP)));
@@ -393,7 +502,7 @@ mod tests {
 
     #[test]
     fn no_upstreams_yields_servfail() {
-        let fwd = forwarder(vec![]);
+        let fwd = forwarder::<Stub>(vec![]);
         let q = query(QUERY_ID, QUERY_NAME);
 
         let relayed = fwd.handle(&encode(&q)).expect("a response is produced");
