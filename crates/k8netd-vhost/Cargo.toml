@@ -9,3 +9,11 @@ description = "vhost-user backend ports for the k8netd L2 switch"
 vhost = "0.17.0"
 vhost-user-backend = "0.23.0"
 vm-memory = "0.18.0"
+
+[dev-dependencies]
+libc = "0.2"
+# Test helper acts as a vhost-user CLIENT (frontend side).
+vhost = { version = "0.17.0", features = ["vhost-user-frontend"] }
+vmm-sys-util = "0.15"
+# Test helper needs GuestMemoryMmap (mmap backend), not enabled by default.
+vm-memory = { version = "0.18.0", features = ["backend-mmap"] }

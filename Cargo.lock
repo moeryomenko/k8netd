@@ -405,9 +405,11 @@ dependencies = [
 name = "k8netd-vhost"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "vhost",
  "vhost-user-backend",
  "vm-memory",
+ "vmm-sys-util",
 ]
 
 [[package]]
