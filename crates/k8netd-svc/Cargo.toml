@@ -9,3 +9,4 @@ description = "Network services (DHCP, DNS, per-port passt WAN) for k8netd"
 dhcproto = "0.15.0"
 hickory-proto = "0.26.1"
 k8netd-core = { path = "../k8netd-core" }
+libc = "0.2"

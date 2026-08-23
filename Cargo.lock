@@ -399,6 +399,7 @@ dependencies = [
  "dhcproto",
  "hickory-proto",
  "k8netd-core",
+ "libc",
 ]
 
 [[package]]
