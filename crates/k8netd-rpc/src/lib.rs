@@ -5,3 +5,4 @@
 //! from spec REQ-001.
 
 pub mod protocol;
+pub mod server;

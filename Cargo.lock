@@ -388,6 +388,7 @@ dependencies = [
 name = "k8netd-rpc"
 version = "0.1.0"
 dependencies = [
+ "k8netd-core",
  "serde",
  "serde_json",
 ]
