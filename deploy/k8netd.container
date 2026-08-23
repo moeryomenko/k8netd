@@ -1,0 +1,46 @@
+# k8netd user quadlet (plan: podman-quadlet-for-k8netd, D2/D3/D6/D7).
+#
+# Install (UID 1000 lab convention — the Go provider hardcodes
+# /run/user/1000/k8snet, internal/chclient/vhostuser.go:30):
+#   install -D -m 644 deploy/k8netd.container \
+#       ~/.config/containers/systemd/k8netd.container
+#   sudo loginctl enable-linger $USER   # keep the unit alive without a session
+#   systemctl --user daemon-reload
+#   systemctl --user start k8netd
+#
+# Build the image first: make image  (-> localhost/k8netd:dev)
+
+[Unit]
+Description=k8netd rootless userspace L2 switch for cloud-hypervisor VMs
+Wants=default.target
+After=default.target
+
+[Container]
+Image=localhost/k8netd:dev
+Network=host
+
+# Single bind, identical paths both sides (grill D6): control.sock, every
+# <port>.sock vhost-user endpoint, and the REQ-010 state.json all live here.
+# cloud-hypervisor dials these exact paths from OUTSIDE the container.
+Mount=type=bind,source=/run/user/1000/k8snet,target=/run/user/1000/k8snet
+
+# Explicit pins (grill D7) — every K8NETD_* value stated, no implicit defaults.
+Environment=K8NETD_SOCKET_DIR=/run/user/1000/k8snet
+Environment=K8NETD_PASST_BINARY=passt
+Environment=K8NETD_UPSTREAM_DNS=1.1.1.1,8.8.8.8
+Environment=K8NETD_MTU=1500
+Environment=K8NETD_PORT_FORWARDS=6443,22
+
+[Service]
+Restart=always
+
+# Conservative hardening on top of an already-rootless container (grill D7).
+# Verified against passt subprocess behavior on the lab host; relax
+# RestrictAddressFamilies first if passt fails to bind its forwards.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=tmpfs
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=default.target
