@@ -1,7 +1,7 @@
 # CI gate for the k8netd workspace. Mirrors the cluster-api-hypervisor
 # `make check` convention (lint + test) for the Rust toolchain.
 
-.PHONY: check fmt-check clippy test help
+.PHONY: check fmt-check clippy test image help
 
 check: fmt-check clippy test ## Run fmt, clippy, and test (CI gate)
 
@@ -16,3 +16,7 @@ test: ## Run the test suite
 
 help: ## Print this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "%-12s %s\n", $$1, $$2}'
+IMAGE ?= localhost/k8netd:dev
+
+image: ## Build the k8netd runtime image (podman)
+	podman build -t $(IMAGE) -f Containerfile .
