@@ -371,9 +371,12 @@ dependencies = [
  "k8netd-rpc",
  "k8netd-svc",
  "k8netd-vhost",
+ "libc",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "vm-memory",
 ]
 
 [[package]]
