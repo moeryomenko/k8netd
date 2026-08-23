@@ -38,14 +38,34 @@ command -v passt >/dev/null 2>&1 || skip "passt not installed"
 [[ -w /dev/kvm ]] || skip "/dev/kvm not accessible"
 command -v python3 >/dev/null 2>&1 || skip "python3 needed for JSON-RPC client"
 
-# --- build -----------------------------------------------------------------
-log "building workspace"
-cargo build --release --workspace || die "cargo build"
+# --- system-under-test selection (grill D9) --------------------------------
+# Quadlet mode: when the user unit is active, exercise the real deployment
+# shape (image + unit) instead of a hand-launched binary. The socket dir then
+# comes from the unit's Environment pin; K8NETD_SOCKET_DIR is ignored.
+SUT_MODE=binary
+if systemctl --user is-active --quiet k8netd 2>/dev/null; then
+	SUT_MODE=quadlet
+	log "SUT: quadlet-managed k8netd.service"
+else
+	log "SUT: hand-launched binary"
+fi
+
+# --- build (binary mode only) ----------------------------------------------
+if [[ "$SUT_MODE" == binary ]]; then
+	log "building workspace"
+	cargo build --release --workspace || die "cargo build"
+fi
 
 # --- step 1: daemon up, control socket answers -----------------------------
-log "starting k8netd at $SOCKET_DIR"
-K8NETD_SOCKET_DIR="$SOCKET_DIR" ./target/release/k8netd &
-DAEMON_PID=$!
+if [[ "$SUT_MODE" == quadlet ]]; then
+	SOCKET_DIR="$(systemctl --user show k8netd -p Environment --value | tr ' ' '\n' | grep '^K8NETD_SOCKET_DIR=' | cut -d= -f2-)"
+	[[ -n "$SOCKET_DIR" ]] || die "quadlet unit does not pin K8NETD_SOCKET_DIR"
+	log "using quadlet socket dir $SOCKET_DIR"
+else
+	log "starting k8netd at $SOCKET_DIR"
+	K8NETD_SOCKET_DIR="$SOCKET_DIR" ./target/release/k8netd &
+	DAEMON_PID=$!
+fi
 for _ in $(seq 1 50); do
 	[[ -S "$CONTROL_SOCK" ]] && break
 	sleep 0.1
@@ -131,10 +151,16 @@ timeout 5 bash -c 'exec 3<>/dev/tcp/127.0.0.1/6443' || die "6443 forward unreach
 
 # --- step 6: restart gate (REQ-010, 60s window) ----------------------------
 log "restart gate: killing daemon and restarting within ${TIMEOUT_S}s"
-kill -9 "$DAEMON_PID" 2>/dev/null || true
-unset DAEMON_PID
-K8NETD_SOCKET_DIR="$SOCKET_DIR" ./target/release/k8netd &
-DAEMON_PID=$!
+if [[ "$SUT_MODE" == quadlet ]]; then
+	# SIGKILL the daemon; systemd Restart=always resurrects it and REQ-010
+	# re-binds the sockets from persisted state.
+	kill -9 "$(systemctl --user show k8netd -p MainPID --value)" 2>/dev/null || true
+else
+	kill -9 "$DAEMON_PID" 2>/dev/null || true
+	unset DAEMON_PID
+	K8NETD_SOCKET_DIR="$SOCKET_DIR" ./target/release/k8netd &
+	DAEMON_PID=$!
+fi
 
 restart_deadline=$((SECONDS + TIMEOUT_S))
 until [[ -S "$CONTROL_SOCK" ]]; do
