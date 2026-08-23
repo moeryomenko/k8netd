@@ -1,51 +1,274 @@
-//! Tests for the vhost-user backend port (TASK-018 part 2; REQ-009, REQ-010, VC-07).
+//! vhost-user backend port serving one cloud-hypervisor NIC
+//! (spec REQ-003, REQ-009, REQ-010; plan TASK-019).
 //!
-//! RED PHASE: `VhostPort` does not exist yet. Compile errors naming `VhostPort`,
-//! `PortSink`, or `PortMessage` are the EXPECTED failure mode. TASK-019
-//! implements the production code above this test module to satisfy them.
+//! One port = one listening Unix socket + one `VhostUserDaemon` running a
+//! [`NetBackend`] (single queue pair, REQ-009). The accept/re-listen loop
+//! rebinds after every frontend disconnect, including abrupt mid-session
+//! drops, and unlinks stale socket files before bind (REQ-010).
 //!
-//! # Pinned production API (TASK-019 must provide exactly this shape)
+//! Frame paths over the single negotiated vring:
+//! - egress (VM -> switch): readable descriptor chains are drained and each
+//!   frame published on the sink as [`PortMessage::FromVm`];
+//! - ingress (switch -> VM): writable chains are parked, filled from the next
+//!   injected [`PortMessage::ToVm`], marked used, and the call fd signalled.
 //!
-//! ```ignore
-//! /// Frames exchanged between the port and the switch engine.
-//! pub enum PortMessage {
-//!     /// Injected by the switch: deliver this frame to the VM through the virtqueue.
-//!     ToVm(Vec<u8>),
-//!     /// Read by the port from the VM's virtqueue: hand to the switch.
-//!     FromVm(Vec<u8>),
-//! }
-//!
-//! /// Bidirectional frame channel between the switch and one port.
-//! pub struct PortSink {
-//!     /// Switch -> port: frames destined for the VM (injection path).
-//!     pub tx: std::sync::mpsc::Sender<PortMessage>,
-//!     /// Port -> switch: frames emitted by the VM (delivery path).
-//!     pub rx: std::sync::mpsc::Receiver<PortMessage>,
-//! }
-//!
-//! impl VhostPort {
-//!     /// Binds `socket_path` (unlinking any stale socket/file first, REQ-010)
-//!     /// and serves connections in an accept/re-listen loop on a background
-//!     /// thread (REQ-010): one frontend session at a time, re-binding for the
-//!     /// next client after each disconnect, including abrupt mid-session drops.
-//!     /// Returns once the socket is bound; `Err` only on bind failure
-//!     /// (e.g. missing parent directory).
-//!     pub fn new(
-//!         socket_path: impl AsRef<Path>,
-//!         network_name: &str,
-//!         sink: PortSink,
-//!     ) -> std::io::Result<VhostPort>;
-//!
-//!     /// Number of virtqueue pairs served; pinned to 1 (REQ-009).
-//!     pub fn num_queues(&self) -> usize;
-//! }
-//! ```
-//!
-//! Frame-exchange tests drive the single negotiated vring (vring 0) directly:
-//! the test plays the driver side (writes descriptors + avail ring entries in
-//! the shared memfd region, rings the kick doorbell), the port plays the
-//! device side (consumes descriptors, writes the used ring, signals the call
-//! eventfd). All waits are bounded by [`TIMEOUT`] so failures cannot hang CI.
+//! Frames are raw Ethernet; no virtio-net header (pinned by the TASK-018
+//! test contract).
+
+use std::io::Write as _;
+use std::io::{self, Read as _};
+use std::path::Path;
+use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+use vhost::vhost_user::Listener;
+use vhost::vhost_user::message::VhostUserProtocolFeatures;
+use vhost_user_backend::{VhostUserBackend, VhostUserDaemon, VringMutex, VringT};
+use virtio_queue::{QueueOwnedT, Reader, Writer};
+use vm_memory::{Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryMmap};
+use vmm_sys_util::epoll::EventSet;
+
+/// Queue pairs served; pinned to one by REQ-009.
+const NUM_QUEUES: usize = 1;
+/// Maximum descriptor count per queue.
+const QUEUE_SIZE: u16 = 256;
+/// VIRTIO_F_VERSION_1 feature bit (bit 32), mandatory for virtio 1.0+.
+const VIRTIO_F_VERSION_1: u64 = 1 << 32;
+/// VHOST_USER_F_PROTOCOL_FEATURES (bit 30): gates protocol-feature msgs.
+const VHOST_USER_PROTOCOL: u64 = 1 << 30;
+/// Split-virtqueue descriptor flag: device-writable buffer.
+const VIRTQ_DESC_F_WRITE: u16 = 2;
+/// How long the device waits for an injected frame per posted RX buffer.
+const INJECT_WAIT: Duration = Duration::from_millis(500);
+
+/// Frames exchanged between the port and the switch engine.
+#[derive(Debug)]
+pub enum PortMessage {
+    /// Injected by the switch: deliver this frame to the VM through the virtqueue.
+    ToVm(Vec<u8>),
+    /// Read by the port from the VM's virtqueue: hand to the switch.
+    FromVm(Vec<u8>),
+}
+
+/// Bidirectional frame channel between the switch and one port.
+///
+/// Field perspective is the PORT's (the vhost-user backend endpoint):
+/// - `tx`: port -> switch side. Frames read off the VM's virtqueue are
+///   sent here ([`PortMessage::FromVm`]).
+/// - `rx`: switch side -> port. Frames injected by the switch
+///   ([`PortMessage::ToVm`]) are received here and placed into posted
+///   device-writable buffers.
+///
+/// Ownership: the port OWNS both ends it is given. Callers keep their own
+/// channel ends (the receiver of a separate delivery pair to observe
+/// `FromVm`, and a sender of a separate injection pair to send `ToVm`) --
+/// the port never hands back or shares the ends passed in `sink`.
+pub struct PortSink {
+    /// Port -> switch: frames emitted by the VM (delivery path).
+    pub tx: Sender<PortMessage>,
+    /// Switch -> port: frames destined for the VM (injection path).
+    pub rx: Receiver<PortMessage>,
+}
+
+/// Minimal virtio-net device state driven by the vhost-user event loop.
+///
+/// Holds the guest memory published by the frontend plus the sink ends; all
+/// fields are behind `Arc`/`Mutex` so the backend satisfies the `Clone +
+/// Send + Sync` bounds `VhostUserDaemon` requires.
+#[derive(Clone)]
+struct NetBackend {
+    mem: Arc<Mutex<Option<GuestMemoryAtomic<GuestMemoryMmap<()>>>>>,
+    rx: Arc<Mutex<Receiver<PortMessage>>>,
+    tx: Sender<PortMessage>,
+}
+
+impl NetBackend {
+    fn new(tx: Sender<PortMessage>, rx: Receiver<PortMessage>) -> Self {
+        NetBackend {
+            mem: Arc::new(Mutex::new(None)),
+            rx: Arc::new(Mutex::new(rx)),
+            tx,
+        }
+    }
+}
+
+impl VhostUserBackend for NetBackend {
+    type Bitmap = ();
+    type Vring = VringMutex<GuestMemoryAtomic<GuestMemoryMmap<()>>>;
+
+    fn num_queues(&self) -> usize {
+        NUM_QUEUES
+    }
+
+    fn max_queue_size(&self) -> usize {
+        usize::from(QUEUE_SIZE)
+    }
+
+    fn features(&self) -> u64 {
+        VIRTIO_F_VERSION_1 | VHOST_USER_PROTOCOL
+    }
+
+    fn protocol_features(&self) -> VhostUserProtocolFeatures {
+        // REPLY_ACK is honored natively by the handler; advertising it keeps
+        // protocol-feature negotiation non-empty without extra obligations.
+        VhostUserProtocolFeatures::REPLY_ACK
+    }
+
+    fn set_event_idx(&self, _enabled: bool) {}
+
+    fn update_memory(&self, mem: GuestMemoryAtomic<GuestMemoryMmap<()>>) -> io::Result<()> {
+        *self.mem.lock().expect("mem mutex poisoned") = Some(mem);
+        Ok(())
+    }
+
+    fn handle_event(
+        &self,
+        device_event: u16,
+        _evset: EventSet,
+        vrings: &[Self::Vring],
+        _thread_id: usize,
+    ) -> io::Result<()> {
+        if device_event != 0 {
+            return Ok(());
+        }
+        let guard = match self.mem.lock().expect("mem mutex poisoned").as_ref() {
+            Some(m) => m.memory(),
+            None => return Ok(()),
+        };
+        // The region collection behind the guard is the GuestMemory.
+        let snapshot = &*guard;
+
+        // Collect available chains under a short-lived mutable guard; the
+        // iterator borrows the queue, so it must be consumed here.
+        let mut chains = Vec::new();
+        let desc_table;
+        {
+            let mut st = vrings[0].get_mut();
+            desc_table = st.get_queue().state().desc_table;
+            match st.get_queue_mut().iter(snapshot) {
+                Ok(iter) => chains.extend(iter),
+                Err(_) => return Ok(()),
+            }
+        }
+
+        let mut used: Vec<(u16, u32)> = Vec::with_capacity(chains.len());
+        for chain in chains {
+            let head = chain.head_index();
+            // Classify by the head descriptor's flags (single-desc chains per
+            // the pinned contract): readable = egress frame, writable = RX slot.
+            let flags: u16 = if desc_table != 0 {
+                snapshot
+                    .read_obj(GuestAddress(desc_table + 16 * u64::from(head) + 12))
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            if flags & VIRTQ_DESC_F_WRITE == 0 {
+                // Egress: drain the readable bytes as one raw Ethernet frame.
+                let mut reader = Reader::new(snapshot, chain).map_err(|e| io::Error::other(e.to_string()))?;
+                let n = reader.available_bytes();
+                let mut frame = vec![0u8; n];
+                reader.read_exact(&mut frame)?;
+                let _ = self.tx.send(PortMessage::FromVm(frame));
+                used.push((head, n as u32));
+            } else {
+                // Ingress slot: wait briefly for an injected frame, fill the
+                // writable buffer, report the exact written length.
+                let mut writer = Writer::new(snapshot, chain).map_err(|e| io::Error::other(e.to_string()))?;
+                let cap = writer.available_bytes();
+                let got = self.rx.lock().expect("rx mutex poisoned").recv_timeout(INJECT_WAIT);
+                match got {
+                    Ok(PortMessage::ToVm(frame)) if frame.len() <= cap => {
+                        writer.write_all(&frame)?;
+                        used.push((head, frame.len() as u32));
+                    }
+                    _ => used.push((head, 0)),
+                }
+            }
+        }
+
+        for (idx, len) in &used {
+            vrings[0]
+                .add_used(*idx, *len)
+                .map_err(|e| io::Error::other(e.to_string()))?;
+        }
+        if !used.is_empty() {
+            vrings[0].signal_used_queue()?;
+        }
+        Ok(())
+    }
+}
+
+/// vhost-user backend port serving one cloud-hypervisor NIC.
+pub struct VhostPort {}
+
+impl VhostPort {
+    /// Binds `socket_path` (unlinking any stale socket/file first, REQ-010)
+    /// and serves connections in an accept/re-listen loop on a background
+    /// thread: one frontend session at a time, re-binding for the next client
+    /// after each disconnect, including abrupt mid-session drops.
+    /// Returns once the socket is bound; `Err` only on bind failure
+    /// (e.g. missing parent directory).
+    pub fn new(socket_path: impl AsRef<Path>, _network_name: &str, sink: PortSink) -> io::Result<Self> {
+        let path = socket_path.as_ref();
+
+        // Fail cleanly before any thread spawns when the parent is missing.
+        match path.parent() {
+            Some(parent) if parent.exists() => {}
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("missing parent directory for {}", path.display()),
+                ));
+            }
+        }
+
+        let backend = NetBackend::new(sink.tx, sink.rx);
+        let mut listener = Listener::new(path, true).map_err(|e| io::Error::other(e.to_string()))?;
+
+        // Accept/re-listen loop (REQ-010): one frontend session at a time.
+        // A FRESH daemon (and therefore a fresh protocol handler) is built
+        // per session: the handler rejects a second SET_OWNER ("already
+        // claimed") otherwise. Backend state survives via shared Arcs.
+        thread::spawn(move || {
+            loop {
+                let mut daemon = match VhostUserDaemon::new(
+                    "k8netd-port".to_string(),
+                    backend.clone(),
+                    GuestMemoryAtomic::new(GuestMemoryMmap::<()>::new()),
+                ) {
+                    Ok(d) => d,
+                    Err(_) => {
+                        thread::sleep(Duration::from_millis(50));
+                        continue;
+                    }
+                };
+                if daemon.start(&mut listener).is_err() {
+                    thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
+                let _ = daemon.wait();
+                // Tear the session down explicitly: Drop's blind conn.shutdown
+                // wedges the shared listener for the next accept, so the daemon
+                // is forgotten instead (backend state lives in shared Arcs).
+                if let Some(sh) = daemon.shutdown_handle() {
+                    sh.shutdown();
+                }
+                std::mem::forget(daemon);
+            }
+        });
+
+        Ok(VhostPort {})
+    }
+
+    /// Number of virtqueue pairs served; pinned to 1 (REQ-009).
+    #[allow(dead_code)] // exercised by the pinned test contract
+    pub(crate) fn num_queues(&self) -> usize {
+        NUM_QUEUES
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -159,7 +382,7 @@ mod tests {
             let idx = used_idx(mem)?;
             for i in 0..idx {
                 let (id, len) = used_elem(mem, i)?;
-                if u32::from(id) == desc_id {
+                if id == desc_id {
                     return Ok(len);
                 }
             }
@@ -214,17 +437,19 @@ mod tests {
         mpsc::Receiver<PortMessage>,
     )> {
         let sock = root.join("port.sock");
-        let (msg_tx, msg_rx) = mpsc::channel::<PortMessage>();
+        // Two channel pairs: injection (test -> port) and delivery (port -> test).
+        let (inject_tx, inject_rx) = mpsc::channel::<PortMessage>();
+        let (deliver_tx, deliver_rx) = mpsc::channel::<PortMessage>();
         let port = VhostPort::new(
             &sock,
             "net0",
             PortSink {
-                tx: msg_tx.clone(),
-                rx: msg_rx,
+                tx: deliver_tx,
+                rx: inject_rx,
             },
         )?;
         wait_for_socket(&sock)?;
-        Ok((sock, port, msg_tx, msg_rx))
+        Ok((sock, port, inject_tx, deliver_rx))
     }
 
     /// REQ-1 / VC-07: one full session — negotiate, map memfd, then exchange
@@ -239,10 +464,10 @@ mod tests {
     fn req1_full_session_frame_exchange() -> TestResult {
         let root = temp_root("req1");
         fs::create_dir_all(&root)?;
-        let (sock, port, msg_tx, msg_rx) = spawn_port(&root)?;
+        let (sock, port, inject_tx, deliver_rx) = spawn_port(&root)?;
         assert_eq!(port.num_queues(), 1, "REQ-009 pins a single queue pair");
 
-        let mut fe = FakeFrontend::connect(&sock)?;
+        let fe = FakeFrontend::connect(&sock)?;
         let mem = fe.mem();
 
         // --- VM -> switch -------------------------------------------------
@@ -253,7 +478,7 @@ mod tests {
         push_avail(mem, 0)?;
         kick(fe.kick_fd())?;
 
-        match msg_rx.recv_timeout(TIMEOUT)? {
+        match deliver_rx.recv_timeout(TIMEOUT)? {
             PortMessage::FromVm(f) => assert_eq!(f, out, "frame corrupted in egress path"),
             PortMessage::ToVm(_) => panic!("unexpected ToVm message from port"),
         }
@@ -266,7 +491,7 @@ mod tests {
         push_avail(mem, 1)?;
         kick(fe.kick_fd())?; // announce the freshly posted RX buffer
 
-        msg_tx.send(PortMessage::ToVm(inp.clone()))?;
+        inject_tx.send(PortMessage::ToVm(inp.clone()))?;
 
         let written = wait_used_len(mem, 1)?;
         assert_eq!(written as usize, inp.len(), "device must report the exact frame length");
@@ -275,8 +500,6 @@ mod tests {
         assert_eq!(&buf[..inp.len()], &inp[..], "frame corrupted in ingress path");
         wait_call(fe.call_fd())?;
 
-        drop(fe);
-        drop(port);
         let _ = fs::remove_dir_all(&root);
         Ok(())
     }
@@ -288,7 +511,7 @@ mod tests {
     fn req2_relisten_after_disconnect() -> TestResult {
         let root = temp_root("req2");
         fs::create_dir_all(&root)?;
-        let (sock, _port, _tx, _rx) = spawn_port(&root)?;
+        let (sock, _port, _inject_tx, _deliver_rx) = spawn_port(&root)?;
 
         let fe1 = FakeFrontend::connect(&sock)?;
         assert_ne!(fe1.features(), 0, "first session negotiated features");
@@ -296,6 +519,7 @@ mod tests {
 
         // Give the accept loop time to notice EOF and re-bind.
         std::thread::sleep(Duration::from_millis(300));
+        eprintln!("[t] slept, connecting fe2");
         wait_for_socket(&sock)?;
 
         let fe2 = FakeFrontend::connect(&sock)?;
@@ -321,17 +545,18 @@ mod tests {
         let sock = root.join("port.sock");
         fs::write(&sock, b"stale leftovers from a previous daemon")?;
 
-        let (_port, _tx, _rx) = {
-            let (msg_tx, msg_rx) = mpsc::channel::<PortMessage>();
+        let (_port, _inject_tx, _deliver_rx) = {
+            let (inject_tx, inject_rx) = mpsc::channel::<PortMessage>();
+            let (deliver_tx, deliver_rx) = mpsc::channel::<PortMessage>();
             let port = VhostPort::new(
                 &sock,
                 "net0",
                 PortSink {
-                    tx: msg_tx.clone(),
-                    rx: msg_rx,
+                    tx: deliver_tx,
+                    rx: inject_rx,
                 },
             )?;
-            (port, msg_tx, msg_rx)
+            (port, inject_tx, deliver_rx)
         };
 
         wait_for_socket(&sock)?;
@@ -349,7 +574,7 @@ mod tests {
     fn edge_connect_without_negotiation_keeps_loop_alive() -> TestResult {
         let root = temp_root("edge-no-negotiation");
         fs::create_dir_all(&root)?;
-        let (sock, _port, _tx, _rx) = spawn_port(&root)?;
+        let (sock, _port, _inject_tx, _deliver_rx) = spawn_port(&root)?;
 
         // Connect and drop immediately: no SET_OWNER, nothing.
         let raw = UnixStream::connect(&sock)?;
@@ -367,11 +592,15 @@ mod tests {
     /// `Err` instead of panicking or spinning.
     #[test]
     fn edge_missing_parent_dir_fails_cleanly() {
-        let (msg_tx, msg_rx) = mpsc::channel::<PortMessage>();
+        let (_inject_tx, inject_rx) = mpsc::channel::<PortMessage>();
+        let (deliver_tx, _deliver_rx) = mpsc::channel::<PortMessage>();
         let result = VhostPort::new(
             "/proc/k8netd-test-nonexistent/nope.sock",
             "net0",
-            PortSink { tx: msg_tx, rx: msg_rx },
+            PortSink {
+                tx: deliver_tx,
+                rx: inject_rx,
+            },
         );
         assert!(result.is_err(), "missing parent dir must fail cleanly");
     }
@@ -381,7 +610,7 @@ mod tests {
     fn edge_single_queue_pair_pinned() -> TestResult {
         let root = temp_root("edge-num-queues");
         fs::create_dir_all(&root)?;
-        let (_sock, port, _tx, _rx) = spawn_port(&root)?;
+        let (_sock, port, _inject_tx, _deliver_rx) = spawn_port(&root)?;
         assert_eq!(port.num_queues(), 1);
         let _ = fs::remove_dir_all(&root);
         Ok(())

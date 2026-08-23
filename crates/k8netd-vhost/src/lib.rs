@@ -4,8 +4,9 @@
 //! (`vhost-user-backend`) that cloud-hypervisor frontends attach to, with
 //! the accept/re-listen loop and stale-socket unlink from spec REQ-009/REQ-010.
 
-#[cfg(test)]
-mod fake_frontend;
+/// Test-only vhost-user CLIENT (frontend) used by integration tests across
+/// the workspace. Harmless in release builds; not part of the daemon API.
+#[doc(hidden)]
+pub mod fake_frontend;
 
-#[cfg(test)]
-mod port;
+pub mod port;

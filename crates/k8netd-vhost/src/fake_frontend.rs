@@ -38,7 +38,7 @@ const VIRTIO_F_VERSION_1: u64 = 1 << 32;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-pub(crate) struct FakeFrontend {
+pub struct FakeFrontend {
     fe: Frontend,
     mem: GuestMemoryMmap<()>,
     kick: EventFd,
@@ -50,7 +50,7 @@ pub(crate) struct FakeFrontend {
 impl FakeFrontend {
     /// Connects to a vhost-user backend socket and runs the full
     /// client-side handshake for a single queue pair.
-    pub(crate) fn connect(socket_path: impl AsRef<Path>) -> Result<Self> {
+    pub fn connect(socket_path: impl AsRef<Path>) -> Result<Self> {
         let mut fe = Frontend::connect(socket_path.as_ref(), u64::from(QUEUE_SIZE))?;
         // Make every request synchronous so handshake failures surface here.
         fe.set_hdr_flags(VhostUserHeaderFlag::NEED_REPLY);
@@ -81,15 +81,19 @@ impl FakeFrontend {
         }])?;
 
         fe.set_vring_num(0, QUEUE_SIZE)?;
+        // The backend handler translates VMM virtual addresses to guest
+        // physical ones via the SET_MEM_TABLE mapping, so the ring addresses
+        // must be expressed in the mapping's address space (userspace base +
+        // ring offset), not as raw guest-physical values.
         fe.set_vring_addr(
             0,
             &VringConfigData {
                 queue_max_size: QUEUE_SIZE,
                 queue_size: QUEUE_SIZE,
                 flags: 0,
-                desc_table_addr: GUEST_BASE + DESC_TABLE_OFFSET,
-                used_ring_addr: GUEST_BASE + USED_RING_OFFSET,
-                avail_ring_addr: GUEST_BASE + AVAIL_RING_OFFSET,
+                desc_table_addr: userspace_addr + DESC_TABLE_OFFSET,
+                used_ring_addr: userspace_addr + USED_RING_OFFSET,
+                avail_ring_addr: userspace_addr + AVAIL_RING_OFFSET,
                 log_addr: None,
             },
         )?;
@@ -122,32 +126,32 @@ impl FakeFrontend {
     }
 
     /// The guest memory handle backing the negotiated region.
-    pub(crate) fn mem(&self) -> &GuestMemoryMmap<()> {
+    pub fn mem(&self) -> &GuestMemoryMmap<()> {
         &self.mem
     }
 
     /// Raw fd of the vring kick eventfd (frontend -> backend doorbell).
-    pub(crate) fn kick_fd(&self) -> RawFd {
+    pub fn kick_fd(&self) -> RawFd {
         self.kick.as_raw_fd()
     }
 
     /// Raw fd of the vring call eventfd (backend -> frontend notification).
-    pub(crate) fn call_fd(&self) -> RawFd {
+    pub fn call_fd(&self) -> RawFd {
         self.call.as_raw_fd()
     }
 
     /// Feature bits sent during SET_FEATURES (backend bits | VERSION_1).
-    pub(crate) fn features(&self) -> u64 {
+    pub fn features(&self) -> u64 {
         self.features
     }
 
     /// Protocol feature bits negotiated during SET_PROTOCOL_FEATURES.
-    pub(crate) fn protocol_features(&self) -> VhostUserProtocolFeatures {
+    pub fn protocol_features(&self) -> VhostUserProtocolFeatures {
         self.protocol_features
     }
 
     /// Mutable access to the underlying frontend for frame-level tests.
-    pub(crate) fn frontend_mut(&mut self) -> &mut Frontend {
+    pub fn frontend_mut(&mut self) -> &mut Frontend {
         &mut self.fe
     }
 }
