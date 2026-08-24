@@ -12,16 +12,17 @@
 //! - `dhcp_leases`: map of chaddr → DhcpLease struct
 //! - `version`: state format version (bumped on structural changes)
 
-// use serde::{Deserialize, Serialize};
-use serde_json;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
+use crate::model::PublishTable;
+
 /// Version of the state format. Increment on structural changes; on startup,
 /// if the stored version is older than the current version, the store refuses
 /// to load and the daemon starts with empty state.
-const STATE_FORMAT_VERSION: &str = "1";
+const STATE_FORMAT_VERSION: u32 = 1;
 
 /// Path to the state file, relative to the socket directory.
 const STATE_FILE_NAME: &str = "state.json";
@@ -57,6 +58,10 @@ pub struct StateSnapshot {
     pub ipam_records: BTreeMap<String, String>,
     /// Maps client MAC (hex string) → DHCP lease struct.
     pub dhcp_leases: BTreeMap<String, DhcpLeaseState>,
+    /// Published inbound-forward allocations (REQ-010); defaults to empty so
+    /// pre-PublishPort state files keep loading.
+    #[serde(default)]
+    pub publish_table: PublishTable,
 }
 
 /// Per-network persisted state.
@@ -106,7 +111,7 @@ pub struct DhcpLeaseState {
 }
 
 /// Mutable in-memory state store exported by this module.
-#[derive(Debug, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
 pub struct StateStore {
     /// Maps network name → persisted state.
     pub networks: BTreeMap<String, NetworkState>,
@@ -116,20 +121,46 @@ pub struct StateStore {
     pub ipam_records: BTreeMap<String, String>,
     /// Maps chaddr (hex, no colons) → DHCP lease struct.
     pub dhcp_leases: BTreeMap<String, DhcpLeaseState>,
+    /// Published inbound-forward allocations keyed by port name
+    /// (REQ-010); survives restart through the atomic save/load pair.
+    pub publish_table: PublishTable,
+}
+
+impl StateSnapshot {
+    /// Captures a versioned snapshot of `store` for serialization.
+    fn from_store(store: &StateStore) -> Self {
+        StateSnapshot {
+            version: STATE_FORMAT_VERSION,
+            networks: store.networks.clone(),
+            ports: store.ports.clone(),
+            ipam_records: store.ipam_records.clone(),
+            dhcp_leases: store.dhcp_leases.clone(),
+            publish_table: store.publish_table.clone(),
+        }
+    }
+}
+
+impl From<StateSnapshot> for StateStore {
+    fn from(s: StateSnapshot) -> Self {
+        StateStore {
+            networks: s.networks,
+            ports: s.ports,
+            ipam_records: s.ipam_records,
+            dhcp_leases: s.dhcp_leases,
+            publish_table: s.publish_table,
+        }
+    }
 }
 
 /// Deserialize a StateSnapshot from a JSON string slice.
 pub fn parse_snapshot(data: &str) -> Result<StateSnapshot, StateError> {
-    serde_json::from_str(data).map_err(|e| StateError::Corrupt {
-        source: e,
-        path: std::path::PathBuf::from("inline"),
-    })
+    serde_json::from_str(data).map_err(|e| StateError::Corrupt { source: e })
 }
 
 /// Serialize a StateSnapshot into a JSON string.
 pub fn serialize_snapshot(snapshot: &StateSnapshot) -> Result<String, StateError> {
     serde_json::to_string(snapshot).map_err(|e| StateError::Io {
-        source: std::io::Error::new(std::io::ErrorKind::Other, e),
+        source: std::io::Error::other(e),
         path: std::path::PathBuf::from("inline"),
     })
 }
@@ -145,15 +176,12 @@ pub fn load_from_disk(path: &Path) -> Result<StateStore, StateError> {
         source: e,
         path: state_path,
     })?;
-    let snapshot: StateSnapshot = serde_json::from_str(&content).map_err(|e| StateError::Corrupt {
-        source: e,
-        path: state_path,
-    })?;
+    let snapshot: StateSnapshot = serde_json::from_str(&content).map_err(|e| StateError::Corrupt { source: e })?;
     // Validate version
     if snapshot.version != STATE_FORMAT_VERSION {
         return Err(StateError::VersionMismatch {
-            expected: STATE_FORMAT_VERSION as u32,
-            found: snapshot.version as u32,
+            expected: STATE_FORMAT_VERSION,
+            found: snapshot.version,
         });
     }
     Ok(snapshot.into())
@@ -166,13 +194,13 @@ pub fn save_to_disk(store: &StateStore, path: &Path) -> Result<(), StateError> {
     let state_path = path.join(STATE_FILE_NAME);
     // Write to a temp file in the same directory first.
     let tmp_path = path.join(".state.json.tmp");
-    let content = serde_json::to_string(store).map_err(|e| StateError::Io {
-        source: std::io::Error::new(std::io::ErrorKind::Other, e),
-        path: tmp_path,
+    let content = serde_json::to_string(&StateSnapshot::from_store(store)).map_err(|e| StateError::Io {
+        source: std::io::Error::other(e),
+        path: tmp_path.clone(),
     })?;
     fs::write(&tmp_path, content).map_err(|e| StateError::Io {
         source: e,
-        path: tmp_path,
+        path: tmp_path.clone(),
     })?;
     // Atomic rename — if the process crashes before this line, the
     // original state file is untouched.
@@ -194,7 +222,7 @@ pub fn remove_network(store: &mut StateStore, name: &str) -> Option<NetworkState
 }
 
 /// Get a network state by name.
-pub fn get_network(store: &StateStore, name: &str) -> Option<&NetworkState> {
+pub fn get_network<'a>(store: &'a StateStore, name: &str) -> Option<&'a NetworkState> {
     store.networks.get(name)
 }
 
@@ -209,7 +237,7 @@ pub fn remove_port(store: &mut StateStore, name: &str) -> Option<PortState> {
 }
 
 /// Get a port state by name.
-pub fn get_port(store: &StateStore, name: &str) -> Option<&PortState> {
+pub fn get_port<'a>(store: &'a StateStore, name: &str) -> Option<&'a PortState> {
     store.ports.get(name)
 }
 
@@ -224,7 +252,7 @@ pub fn remove_ipam(store: &mut StateStore, chaddr: &str) -> Option<String> {
 }
 
 /// Get an IPAM record.
-pub fn get_ipam(store: &StateStore, chaddr: &str) -> Option<&String> {
+pub fn get_ipam<'a>(store: &'a StateStore, chaddr: &str) -> Option<&'a String> {
     store.ipam_records.get(chaddr)
 }
 
@@ -239,7 +267,7 @@ pub fn remove_dhcp_lease(store: &mut StateStore, chaddr: &str) -> Option<DhcpLea
 }
 
 /// Get a DHCP lease state entry.
-pub fn get_dhcp_lease(store: &StateStore, chaddr: &str) -> Option<&DhcpLeaseState> {
+pub fn get_dhcp_lease<'a>(store: &'a StateStore, chaddr: &str) -> Option<&'a DhcpLeaseState> {
     store.dhcp_leases.get(chaddr)
 }
 

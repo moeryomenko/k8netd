@@ -5,7 +5,7 @@
 //! (red phase). TASK-003 implements the types in this file to make the tests
 //! pass; the tests module stays at the bottom of the file per Rust convention.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
@@ -267,6 +267,49 @@ pub struct DhcpLease {
     pub lease_seconds: u64,
 }
 
+/// Published inbound-forward allocations for attached ports (spec REQ-010).
+///
+/// Maps a port name to its published entries, each binding a VM-side TCP port
+/// to the allocated host-side TCP port. The nested map keeps serde_json keys
+/// legal (tuple keys do not serialize). Only published entries produce
+/// inbound `-t` forwards in that port's passt argv.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PublishTable {
+    /// Published entries keyed by port name, then vm_port -> host_port.
+    pub entries: BTreeMap<String, BTreeMap<u16, u16>>,
+}
+
+impl PublishTable {
+    /// Returns the recorded host_port for `(port, vm_port)`, if published.
+    pub fn get(&self, port: &str, vm_port: u16) -> Option<u16> {
+        self.entries.get(port).and_then(|m| m.get(&vm_port)).copied()
+    }
+
+    /// Removes every entry for `port`; returns whether anything was removed.
+    ///
+    /// Called on DetachPort/DeletePort of the owning port (REQ-010: freeing
+    /// happens with the owning port's detach or delete).
+    pub fn remove_port(&mut self, port: &str) -> bool {
+        self.entries.remove(port).is_some()
+    }
+
+    /// Allocates the lowest free host_port in the inclusive `range` for
+    /// `(port, vm_port)`, records it, and returns it.
+    ///
+    /// Idempotent: an existing entry for the pair is returned unchanged.
+    /// Returns `None` when the range is exhausted; in that case no state is
+    /// mutated (REQ-010: no partial state on failure).
+    pub fn allocate(&mut self, port: &str, vm_port: u16, range: (u16, u16)) -> Option<u16> {
+        if let Some(host) = self.get(port, vm_port) {
+            return Some(host);
+        }
+        let used: BTreeSet<u16> = self.entries.values().flat_map(|m| m.values().copied()).collect();
+        let host = (range.0..=range.1).find(|p| !used.contains(p))?;
+        self.entries.entry(port.to_string()).or_default().insert(vm_port, host);
+        Some(host)
+    }
+}
+
 /// The persisted daemon state: networks, ports, allocations, and leases (spec REQ-010).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct State {
@@ -278,6 +321,8 @@ pub struct State {
     pub allocations: Vec<Allocation>,
     /// DHCP lease records.
     pub leases: Vec<DhcpLease>,
+    /// Published inbound-forward allocations (spec REQ-010); survives restart.
+    pub publish_table: PublishTable,
 }
 
 #[cfg(test)]
@@ -334,6 +379,7 @@ mod tests {
     //   - Serialize, Deserialize, PartialEq, Eq, Clone, Debug
 
     use super::*;
+    use std::collections::BTreeMap;
     use std::net::Ipv4Addr;
     use std::path::PathBuf;
 
@@ -605,5 +651,35 @@ mod tests {
         let json = serde_json::to_string(&state).unwrap();
         let restored: State = serde_json::from_str(&json).unwrap();
         assert_eq!(state, restored);
+    }
+
+    // TASK-001 (SPEC-CAPISHIM-HYPERVISOR-INTEGRATION REQ-010 / VC-06):
+    // the persisted publish table. Red phase: pins `State.publish_table` and
+    // the `PublishTable` type in k8netd-core; compile failure on those seams
+    // is the expected red evidence until the engineer wires them.
+
+    /// The publish table round-trips through State serde alongside networks,
+    /// ports, allocations, and leases (REQ-010: allocations survive restart
+    /// via state.json).
+    #[test]
+    fn state_round_trip_preserves_publish_table() {
+        let mut state = State::default();
+        state.publish_table.entries.insert(
+            "vm-a".to_string(),
+            BTreeMap::from([(6443u16, 20000u16), (22u16, 20001u16)]),
+        );
+        state
+            .publish_table
+            .entries
+            .insert("vm-b".to_string(), BTreeMap::from([(6443u16, 20002u16)]));
+
+        let json = serde_json::to_string(&state).unwrap();
+        let restored: State = serde_json::from_str(&json).unwrap();
+        assert_eq!(state, restored);
+        assert_eq!(
+            restored.publish_table.entries["vm-a"][&6443], 20000,
+            "(port, vm_port) -> host_port mapping must survive the round trip"
+        );
+        assert_eq!(restored.publish_table.entries["vm-b"][&6443], 20002);
     }
 }

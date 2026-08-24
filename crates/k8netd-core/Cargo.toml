@@ -8,3 +8,4 @@ description = "Domain model and L2 switch engine for k8netd"
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+thiserror = "2.0.16"
