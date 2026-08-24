@@ -1,6 +1,9 @@
 //! Daemon configuration: `K8NETD_*` env vars with CLI-flag override
-//! (spec REQ-001 socket dir, REQ-006 upstreams, REQ-008 port forwards;
+//! (spec REQ-001 socket dir, REQ-006 upstreams, REQ-010 publish range;
 //! plan TASK-028/029). No config file — flags/env only.
+//!
+//! Static passt forwards are retired (REQ-011): `K8NETD_PORT_FORWARDS` is
+//! ignored, and inbound forwards come exclusively from the PublishPort RPC.
 
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
@@ -16,8 +19,12 @@ pub struct Config {
     pub upstream_dns: Vec<Ipv4Addr>,
     /// MTU for the virtual networks.
     pub mtu: u16,
-    /// TCP ports forwarded to every attached VM via passt.
+    /// Retired static forwards (REQ-011): always empty; inbound forwards are
+    /// allocated exclusively through the PublishPort RPC.
     pub port_forwards: Vec<u16>,
+    /// Inclusive host-port range the PublishPort allocator hands out
+    /// (REQ-010), parsed from `K8NETD_PUBLISH_RANGE=start-end`.
+    pub publish_range: (u16, u16),
 }
 
 /// Configuration failures surfaced at startup.
@@ -47,7 +54,9 @@ pub const DEFAULT_SOCKET_DIR: &str = "/run/user/1000/k8snet";
 pub const DEFAULT_PASST_BINARY: &str = "passt";
 pub const DEFAULT_UPSTREAM_DNS: &str = "1.1.1.1,8.8.8.8";
 pub const DEFAULT_MTU: u16 = 1500;
-pub const DEFAULT_PORT_FORWARDS: &str = "6443,22";
+/// Default PublishPort allocation range (REQ-010), below the typical Linux
+/// ephemeral port range.
+pub const DEFAULT_PUBLISH_RANGE: (u16, u16) = (20_000, 21_000);
 
 /// CLI flags; `None` means "fall through to the env/default".
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -56,7 +65,6 @@ pub struct Flags {
     pub passt_binary: Option<String>,
     pub upstream_dns: Option<String>,
     pub mtu: Option<u16>,
-    pub port_forwards: Option<String>,
 }
 
 impl Config {
@@ -94,12 +102,14 @@ impl Config {
             },
         };
 
-        let fw_raw = flags
-            .port_forwards
-            .clone()
-            .or_else(|| getenv("K8NETD_PORT_FORWARDS"))
-            .unwrap_or_else(|| DEFAULT_PORT_FORWARDS.to_string());
-        let port_forwards = parse_port_list("K8NETD_PORT_FORWARDS", &fw_raw)?;
+        // REQ-011: K8NETD_PORT_FORWARDS is retired — deliberately not read;
+        // the deprecation warning is logged by the daemon at startup.
+        let port_forwards = Vec::new();
+
+        let publish_range = match getenv("K8NETD_PUBLISH_RANGE") {
+            Some(raw) => parse_publish_range(&raw)?,
+            None => DEFAULT_PUBLISH_RANGE,
+        };
 
         Ok(Config {
             socket_dir,
@@ -107,6 +117,7 @@ impl Config {
             upstream_dns,
             mtu,
             port_forwards,
+            publish_range,
         })
     }
 
@@ -131,34 +142,27 @@ fn parse_ip_list(key: &str, raw: &str) -> Result<Vec<Ipv4Addr>, ConfigError> {
     Ok(out)
 }
 
-/// Parses a comma-separated TCP port list; rejects empty entries, non-numbers,
-/// and zero.
-fn parse_port_list(key: &str, raw: &str) -> Result<Vec<u16>, ConfigError> {
-    let mut out = Vec::new();
-    for part in raw.split(',') {
-        if part.trim().is_empty() {
-            return Err(ConfigError::EmptyListEntry { key: key.into() });
-        }
-        let p: u16 = part.trim().parse().map_err(|_| ConfigError::InvalidValue {
-            key: key.into(),
-            value: raw.to_string(),
-        })?;
-        if p == 0 {
-            return Err(ConfigError::InvalidValue {
-                key: key.into(),
-                value: raw.to_string(),
-            });
-        }
-        out.push(p);
+/// Parses a `start-end` host-port range (REQ-010); rejects a missing dash,
+/// non-numeric or out-of-domain bounds, and reversed bounds.
+fn parse_publish_range(raw: &str) -> Result<(u16, u16), ConfigError> {
+    let invalid = || ConfigError::InvalidValue {
+        key: "K8NETD_PUBLISH_RANGE".into(),
+        value: raw.to_string(),
+    };
+    let (start_raw, end_raw) = raw.split_once('-').ok_or_else(invalid)?;
+    let start: u16 = start_raw.parse().map_err(|_| invalid())?;
+    let end: u16 = end_raw.parse().map_err(|_| invalid())?;
+    if start > end {
+        return Err(invalid());
     }
-    Ok(out)
+    Ok((start, end))
 }
 
 /// Parses CLI arguments into [`Flags`] (flag-over-env precedence).
 ///
 /// Recognized: `--socket-dir <p>`, `--passt-binary <b>`, `--upstream-dns <l>`,
-/// `--mtu <n>`, `--port-forwards <l>`. Unknown flags are rejected so typos
-/// fail loudly at startup.
+/// `--mtu <n>`. Unknown flags are rejected so typos fail loudly at startup
+/// (this includes the retired `--port-forwards`).
 pub fn parse_flags<I: Iterator<Item = String>>(args: I) -> Result<Flags, ConfigError> {
     let mut f = Flags::default();
     let mut it = args.peekable();
@@ -178,7 +182,6 @@ pub fn parse_flags<I: Iterator<Item = String>>(args: I) -> Result<Flags, ConfigE
             }
             "--passt-binary" => take(&mut f.passt_binary)?,
             "--upstream-dns" => take(&mut f.upstream_dns)?,
-            "--port-forwards" => take(&mut f.port_forwards)?,
             "--mtu" => {
                 let mut v = None;
                 take(&mut v)?;
@@ -223,7 +226,8 @@ mod tests {
             vec![Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(8, 8, 8, 8)]
         );
         assert_eq!(c.mtu, 1500);
-        assert_eq!(c.port_forwards, vec![6443, 22]);
+        // REQ-011: static forwards are retired; the field stays empty.
+        assert!(c.port_forwards.is_empty());
         Ok(())
     }
 
@@ -235,14 +239,14 @@ mod tests {
             ("K8NETD_PASST_BINARY", "/usr/bin/passt"),
             ("K8NETD_UPSTREAM_DNS", "9.9.9.9"),
             ("K8NETD_MTU", "1400"),
-            ("K8NETD_PORT_FORWARDS", "8080"),
         ]);
         let c = Config::resolve(&Flags::default(), &e)?;
         assert_eq!(c.socket_dir, PathBuf::from("/tmp/x"));
         assert_eq!(c.passt_binary, "/usr/bin/passt");
         assert_eq!(c.upstream_dns, vec![Ipv4Addr::new(9, 9, 9, 9)]);
         assert_eq!(c.mtu, 1400);
-        assert_eq!(c.port_forwards, vec![8080]);
+        // REQ-011: static forwards are retired; the field stays empty.
+        assert!(c.port_forwards.is_empty());
         Ok(())
     }
 
@@ -258,8 +262,8 @@ mod tests {
         let c = Config::resolve(&flags, &e)?;
         assert_eq!(c.socket_dir, PathBuf::from("/from-flag"));
         assert_eq!(c.mtu, 9000);
-        // Untouched settings still fall through to env.
-        assert_eq!(c.port_forwards, vec![6443, 22]);
+        // REQ-011: static forwards are retired; nothing falls through to env.
+        assert!(c.port_forwards.is_empty());
         Ok(())
     }
 
@@ -270,8 +274,6 @@ mod tests {
             ("K8NETD_MTU", "notanumber"),
             ("K8NETD_UPSTREAM_DNS", "1.1.1.1,banana"),
             ("K8NETD_UPSTREAM_DNS", "1.1.1.1,,8.8.8.8"),
-            ("K8NETD_PORT_FORWARDS", "6443,,22"),
-            ("K8NETD_PORT_FORWARDS", "0"),
         ];
         for (key, val) in cases {
             let pair = [(key, val)];
@@ -288,7 +290,7 @@ mod tests {
         Ok(())
     }
 
-    /// Flag parsing covers all five flags and rejects unknown ones.
+    /// Flag parsing covers all flags and rejects unknown ones.
     #[test]
     fn parse_flags_and_unknown_rejection() -> TestResult {
         let args = [
@@ -300,8 +302,6 @@ mod tests {
             "9.9.9.9",
             "--mtu",
             "8888",
-            "--port-forwards",
-            "1,2",
         ]
         .iter()
         .map(|s| s.to_string());
@@ -310,13 +310,79 @@ mod tests {
         assert_eq!(f.passt_binary, Some("pb".into()));
         assert_eq!(f.upstream_dns, Some("9.9.9.9".into()));
         assert_eq!(f.mtu, Some(8888));
-        assert_eq!(f.port_forwards, Some("1,2".into()));
 
         let bad = ["--nope"].iter().map(|s| s.to_string());
         assert!(parse_flags(bad).is_err(), "unknown flag must be rejected");
 
+        // REQ-011: the retired --port-forwards flag is no longer recognized.
+        let retired = ["--port-forwards", "1,2"].iter().map(|s| s.to_string());
+        assert!(
+            parse_flags(retired).is_err(),
+            "retired --port-forwards must be rejected like an unknown flag"
+        );
+
         let missing = ["--mtu"].iter().map(|s| s.to_string());
         assert!(parse_flags(missing).is_err(), "dangling flag must be rejected");
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // TASK-001 (SPEC-CAPISHIM-HYPERVISOR-INTEGRATION REQ-010 / REQ-011):
+    // publish range configuration and retirement of static forwards.
+    // Red phase: pins `Config.publish_range` (default 20000-21000, env
+    // K8NETD_PUBLISH_RANGE=start-end) and the REQ-011 behavior that
+    // K8NETD_PORT_FORWARDS is ignored. Compile failure on the new field is
+    // expected red evidence; the deprecation test is a runtime red.
+    // -----------------------------------------------------------------------
+
+    /// K8NETD_PUBLISH_RANGE=start-end parses into the configured bounds.
+    #[test]
+    fn publish_range_env_parses_start_end() -> TestResult {
+        let e = env(&[("K8NETD_PUBLISH_RANGE", "30000-30100")]);
+        let c = Config::resolve(&Flags::default(), &e)?;
+        assert_eq!(c.publish_range, (30000, 30100));
+        Ok(())
+    }
+
+    /// Default publish range is 20000-21000 (REQ-010).
+    #[test]
+    fn publish_range_defaults_to_20000_21000() -> TestResult {
+        let c = Config::resolve(&Flags::default(), &|_| None)?;
+        assert_eq!(c.publish_range, (20000, 21000));
+        Ok(())
+    }
+
+    /// Malformed ranges are rejected at startup: missing dash, non-numeric
+    /// bounds, reversed bounds, dangling dash.
+    #[test]
+    fn publish_range_malformed_values_rejected() -> TestResult {
+        for raw in ["20000", "banana", "21000-20000", "20000-", "-20000"] {
+            let pair = [("K8NETD_PUBLISH_RANGE", raw)];
+            let e = env(&pair);
+            let err = Config::resolve(&Flags::default(), &e).expect_err(raw);
+            assert!(
+                matches!(err, ConfigError::InvalidValue { .. }),
+                "K8NETD_PUBLISH_RANGE={raw} must be rejected"
+            );
+        }
+        Ok(())
+    }
+
+    /// REQ-011: K8NETD_PORT_FORWARDS is retired — setting it must no longer
+    /// populate static forwards; the parsed config ignores it.
+    ///
+    /// Intended runtime red against current code (which parses the var into
+    /// `port_forwards`). Implementer note: `defaults_match_plan` and
+    /// `env_overrides_defaults` above pin the retired behavior and must be
+    /// updated alongside REQ-011.
+    #[test]
+    fn deprecated_port_forwards_env_is_ignored() -> TestResult {
+        let e = env(&[("K8NETD_PORT_FORWARDS", "8080")]);
+        let c = Config::resolve(&Flags::default(), &e)?;
+        assert!(
+            c.port_forwards.is_empty(),
+            "static forwards are retired; K8NETD_PORT_FORWARDS must be ignored"
+        );
         Ok(())
     }
 }
