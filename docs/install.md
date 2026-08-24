@@ -72,10 +72,16 @@ the defaults below come from `config.rs`.
 | `K8NETD_PASST_BINARY` | `passt` | `config.rs` (`DEFAULT_PASST_BINARY`) |
 | `K8NETD_UPSTREAM_DNS` | `1.1.1.1,8.8.8.8` | `config.rs` (`DEFAULT_UPSTREAM_DNS`) |
 | `K8NETD_MTU` | `1500` | `config.rs` (`DEFAULT_MTU`) |
-| `K8NETD_PORT_FORWARDS` | `6443,22` | `config.rs` (`DEFAULT_PORT_FORWARDS`) |
+| `K8NETD_PUBLISH_RANGE` | `20000-21000` | `config.rs` (`DEFAULT_PUBLISH_RANGE`) |
 
 Invalid values abort startup (`ConfigError`); flags override env overrides
 defaults (`config::resolve`).
+
+Inbound port forwards are allocated exclusively through the idempotent
+`PublishPort` RPC (REQ-010) from the `K8NETD_PUBLISH_RANGE` range and are
+persisted in `state.json`. The retired static-forward variables
+(`K8NETD_PORT_FORWARDS`, `K8NETD_PASST_FORWARDS`) are ignored with a
+deprecation warning at startup (REQ-011).
 
 ---
 
@@ -140,7 +146,8 @@ the rootless design (spec §1: "performs no privileged host operation"):
 - The L2 switch, DHCP/DNS servers, and IPAM are userspace packet handlers; the
   gateway IP is not a real interface, so no privileged port binding occurs.
 - passt is designed unprivileged; with `Network=host` its inbound forwards
-  bind directly on the host so `127.0.0.1:6443` reaches the control-plane VM
+  bind directly on the host so a published control-plane port (allocated via
+  `PublishPort`, e.g. `127.0.0.1:<host-port>`) reaches the control-plane VM
   (VC-09) and egress reaches the pinned upstream resolvers unchanged.
 - Rootless podman maps host UID 1000 to container root, so files created in
   the mounted socket dir carry correct host ownership without a `USER`
