@@ -16,10 +16,14 @@ use std::os::unix::net::UnixListener;
 use std::path::Path;
 
 use k8netd_core::ipam::{Ipam, IpamError};
-use k8netd_core::model::{IpPool, MacAddr, Network, Port};
+use k8netd_core::model::{IpPool, MacAddr, Network, Port, PublishTable};
 use serde_json::{Value, json};
 
 use crate::protocol::{Request, Response, RpcError};
+
+/// Default inclusive host-port range for the PublishPort allocator
+/// (REQ-010); chosen below the typical Linux ephemeral port range.
+pub const DEFAULT_PUBLISH_RANGE: (u16, u16) = (20_000, 21_000);
 
 /// The control-plane operations exposed over the control socket.
 ///
@@ -36,6 +40,10 @@ pub trait ControlPlane {
     fn detach_port(&mut self, params: &Value) -> Result<Value, RpcError>;
     fn allocate_ip(&mut self, params: &Value) -> Result<Value, RpcError>;
     fn release_ip(&mut self, params: &Value) -> Result<Value, RpcError>;
+    /// Publishes an inbound forward for `(port, vm_port)` and returns the
+    /// allocated host port (REQ-010). Idempotent per pair; errors for
+    /// unknown or unattached ports; exhaustion surfaces as `conflict`.
+    fn publish_port(&mut self, params: &Value) -> Result<Value, RpcError>;
 }
 
 /// Routes parsed requests to a [`ControlPlane`], mapping domain failures to
@@ -63,6 +71,7 @@ impl<C: ControlPlane> Router<C> {
             "DetachPort" => self.cp.detach_port(req.params.as_ref().unwrap_or(&Value::Null)),
             "AllocateIP" => self.cp.allocate_ip(req.params.as_ref().unwrap_or(&Value::Null)),
             "ReleaseIP" => self.cp.release_ip(req.params.as_ref().unwrap_or(&Value::Null)),
+            "PublishPort" => self.cp.publish_port(req.params.as_ref().unwrap_or(&Value::Null)),
             _ => Err(RpcError::MethodNotFound),
         };
         match result {
@@ -83,6 +92,16 @@ impl<C: ControlPlane> Router<C> {
 
 fn str_param<'a>(params: &'a Value, key: &str) -> Result<&'a str, RpcError> {
     params.get(key).and_then(Value::as_str).ok_or(RpcError::InvalidParams)
+}
+
+/// Extracts a `u16` parameter, rejecting values outside the u16 domain.
+fn u16_param(params: &Value, key: &str) -> Result<u16, RpcError> {
+    params
+        .get(key)
+        .and_then(Value::as_u64)
+        .filter(|v| *v <= u64::from(u16::MAX))
+        .map(|v| v as u16)
+        .ok_or(RpcError::InvalidParams)
 }
 
 fn ipam_error(e: IpamError) -> RpcError {
@@ -106,15 +125,48 @@ struct NetworkEntry {
 
 /// In-memory [`ControlPlane`] over `k8netd-core` types. Port sockets are
 /// modelled by path only here; the real socket lifecycle is wired in TASK-031.
-#[derive(Default)]
 pub struct MemoryControlPlane {
     networks: BTreeMap<String, NetworkEntry>,
     ports: BTreeMap<String, Port>,
+    /// Inclusive host-port range the publish allocator hands out (REQ-010).
+    publish_range: (u16, u16),
+    /// Published inbound-forward allocations keyed by port name.
+    publish_table: PublishTable,
+}
+
+impl Default for MemoryControlPlane {
+    fn default() -> Self {
+        MemoryControlPlane {
+            networks: BTreeMap::new(),
+            ports: BTreeMap::new(),
+            publish_range: DEFAULT_PUBLISH_RANGE,
+            publish_table: PublishTable::default(),
+        }
+    }
 }
 
 impl MemoryControlPlane {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates a control plane whose publish allocator hands out host ports
+    /// from the inclusive range `[start, end]` (REQ-010 exhaustion probes).
+    pub fn with_publish_range(start: u16, end: u16) -> Self {
+        Self {
+            publish_range: (start, end),
+            ..Self::default()
+        }
+    }
+
+    /// Restores a control plane from a persisted state store, seeding the
+    /// publish allocator so re-publishes honor pre-restart allocations
+    /// (REQ-010 / VC-06 restart path).
+    pub fn from_store(store: k8netd_core::state::StateStore) -> Self {
+        Self {
+            publish_table: store.publish_table,
+            ..Self::default()
+        }
     }
 }
 
@@ -186,6 +238,8 @@ impl ControlPlane for MemoryControlPlane {
 
     fn delete_port(&mut self, params: &Value) -> Result<Value, RpcError> {
         let name = str_param(params, "name")?;
+        // REQ-010: deleting the owning port frees its published allocations.
+        self.publish_table.remove_port(name);
         self.ports.remove(name).map(|_| Value::Null).ok_or(RpcError::NotFound)
     }
 
@@ -230,6 +284,8 @@ impl ControlPlane for MemoryControlPlane {
         // Detaching an already-detached port is a no-op success; the socket
         // stays alive either way (REQ-003).
         port.detach();
+        // REQ-010: detaching the owning port frees its published allocations.
+        self.publish_table.remove_port(name);
         Ok(Value::Null)
     }
 
@@ -250,6 +306,28 @@ impl ControlPlane for MemoryControlPlane {
             other => ipam_error(other),
         })?;
         Ok(Value::Null)
+    }
+
+    fn publish_port(&mut self, params: &Value) -> Result<Value, RpcError> {
+        let port_name = str_param(params, "port")?;
+        let vm_port = u16_param(params, "vm_port")?;
+
+        // REQ-010: only attached ports are publishable; unknown and
+        // unattached (including since-detached) ports are not_found.
+        let port = self.ports.get(port_name).ok_or(RpcError::NotFound)?;
+        if port.network.is_none() {
+            return Err(RpcError::NotFound);
+        }
+
+        // Idempotent re-publish returns the recorded allocation unchanged.
+        let host_port = match self.publish_table.get(port_name, vm_port) {
+            Some(host) => host,
+            None => self
+                .publish_table
+                .allocate(port_name, vm_port, self.publish_range)
+                .ok_or(RpcError::Conflict)?, // range exhaustion; no partial state
+        };
+        Ok(json!({ "host_port": host_port }))
     }
 }
 
@@ -620,6 +698,230 @@ mod tests {
         drop(client);
         // serve() loops forever by design; detach rather than block the test.
         std::mem::forget(handle);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // TASK-001 (SPEC-CAPISHIM-HYPERVISOR-INTEGRATION REQ-010 / VC-06):
+    // PublishPort allocator contract. Red phase: pins the `PublishPort`
+    // routing, `ControlPlane::publish_port`, `MemoryControlPlane::
+    // with_publish_range`, `MemoryControlPlane::from_store`, and the
+    // `k8netd_core::state` persistence seam. Compile failure on those seams
+    // is the expected red evidence until the engineer wires them.
+    // -----------------------------------------------------------------------
+
+    /// Builds a PublishPort request for `(port, vm_port)`.
+    fn pub_req(port: &str, vm_port: u16, id: i64) -> Request {
+        Request::new(
+            "PublishPort",
+            Some(json!({"port": port, "vm_port": vm_port})),
+            json!(id),
+        )
+    }
+
+    /// Creates network `net0` plus one attached port with the given MAC,
+    /// the minimum state REQ-010 allows publishing against.
+    fn attached_port(r: &mut Router<MemoryControlPlane>, name: &str, mac: &str) {
+        create_net(r, "192.168.124.0/24");
+        r.dispatch(Request::new("CreatePort", Some(json!({ "name": name })), json!(2)));
+        let att = Request::new(
+            "AttachPort",
+            Some(json!({"port": name, "network": "net0", "mac": mac})),
+            json!(3),
+        );
+        let resp = r.dispatch(att);
+        assert!(resp.error.is_none(), "setup: attach of {name} must succeed");
+    }
+
+    /// Extracts `host_port` from a successful PublishPort response.
+    fn host_port_of(resp: Response) -> u16 {
+        resp.result.unwrap()["host_port"].as_u64().unwrap() as u16
+    }
+
+    /// REQ-010 / VC-06: identical (port, vm_port) re-publish returns the
+    /// same host_port from the default 20000-21000 range.
+    #[test]
+    fn publish_port_idempotent_same_params_same_host_port() -> TestResult {
+        let mut r = router();
+        attached_port(&mut r, "vm1", "02:00:00:00:00:01");
+        let first = host_port_of(r.dispatch(pub_req("vm1", 6443, 1)));
+        let again = host_port_of(r.dispatch(pub_req("vm1", 6443, 2)));
+        assert_eq!(first, again, "identical re-publish must return the same host_port");
+        assert!(
+            (20000..=21000).contains(&first),
+            "allocation must come from the default range"
+        );
+        Ok(())
+    }
+
+    /// REQ-010 / VC-06: a different vm_port on the same port gets a distinct
+    /// allocation.
+    #[test]
+    fn publish_port_distinct_vm_port_gets_distinct_host_port() -> TestResult {
+        let mut r = router();
+        attached_port(&mut r, "vm1", "02:00:00:00:00:01");
+        let api = host_port_of(r.dispatch(pub_req("vm1", 6443, 1)));
+        let ssh = host_port_of(r.dispatch(pub_req("vm1", 22, 2)));
+        assert_ne!(api, ssh, "distinct vm_ports must get distinct host_ports");
+        assert!((20000..=21000).contains(&api));
+        assert!((20000..=21000).contains(&ssh));
+        Ok(())
+    }
+
+    /// REQ-010: publishing for a never-created port is a typed not_found.
+    #[test]
+    fn publish_port_unknown_port_is_error() -> TestResult {
+        let mut r = router();
+        let resp = r.dispatch(pub_req("ghost", 6443, 1));
+        assert_eq!(resp.error.map(|e| e.code()), Some("not_found"));
+        Ok(())
+    }
+
+    /// REQ-010: created-but-unattached and since-detached ports are not
+    /// publishable.
+    #[test]
+    fn publish_port_unattached_port_is_error() -> TestResult {
+        let mut r = router();
+        r.dispatch(Request::new("CreatePort", Some(json!({ "name": "lonely" })), json!(1)));
+        let resp = r.dispatch(pub_req("lonely", 6443, 2));
+        assert_eq!(resp.error.map(|e| e.code()), Some("not_found"), "unattached port");
+
+        attached_port(&mut r, "vm1", "02:00:00:00:00:01");
+        assert!(r.dispatch(pub_req("vm1", 6443, 3)).error.is_none());
+        r.dispatch(Request::new("DetachPort", Some(json!({ "name": "vm1" })), json!(4)));
+        let resp = r.dispatch(pub_req("vm1", 6443, 5));
+        assert_eq!(resp.error.map(|e| e.code()), Some("not_found"), "detached port");
+        Ok(())
+    }
+
+    /// REQ-010 / VC-06: exhaustion is a typed error and leaks no partial
+    /// state — the failed publish consumes nothing, so freeing one slot lets
+    /// the previously-failing publish succeed. Exhaustion is pinned to the
+    /// `conflict` code, matching the existing IPAM PoolExhausted mapping.
+    #[test]
+    fn publish_range_exhaustion_typed_error_no_partial_state() -> TestResult {
+        // Capacity 2: vm1 and vm2 fill the range, vm3 must hit the error.
+        let mut r = Router::new(MemoryControlPlane::with_publish_range(20000, 20001));
+        attached_port(&mut r, "vm1", "02:00:00:00:00:01");
+        attached_port(&mut r, "vm2", "02:00:00:00:00:02");
+        attached_port(&mut r, "vm3", "02:00:00:00:00:03");
+        assert!(r.dispatch(pub_req("vm1", 6443, 1)).error.is_none());
+        assert!(r.dispatch(pub_req("vm2", 6443, 2)).error.is_none());
+
+        let resp = r.dispatch(pub_req("vm3", 6443, 3));
+        assert_eq!(
+            resp.error.map(|e| e.code()),
+            Some("conflict"),
+            "exhaustion must surface as the typed conflict code"
+        );
+
+        // Free one slot; the failed publish must not have leaked a
+        // reservation, so vm3 now succeeds.
+        r.dispatch(Request::new("DetachPort", Some(json!({ "name": "vm1" })), json!(4)));
+        let got = r.dispatch(pub_req("vm3", 6443, 5));
+        assert!(got.error.is_none(), "failed publish must not leak a reservation");
+        let hp = host_port_of(got);
+        assert!((20000..=20001).contains(&hp));
+        assert_eq!(
+            host_port_of(r.dispatch(pub_req("vm3", 6443, 6))),
+            hp,
+            "still idempotent"
+        );
+        Ok(())
+    }
+
+    /// REQ-010 / VC-06: DetachPort of the owning port frees every allocation
+    /// it held. Proven by capacity, not allocation order: a full range
+    /// becomes publishable again exactly for the freed slots.
+    #[test]
+    fn detach_port_frees_allocations() -> TestResult {
+        // Capacity 3: vm1 holds two allocations (6443 + 22), vm2 one.
+        let mut r = Router::new(MemoryControlPlane::with_publish_range(20000, 20002));
+        attached_port(&mut r, "vm1", "02:00:00:00:00:01");
+        attached_port(&mut r, "vm2", "02:00:00:00:00:02");
+        attached_port(&mut r, "vm3", "02:00:00:00:00:03");
+        attached_port(&mut r, "vm4", "02:00:00:00:00:04");
+        assert!(r.dispatch(pub_req("vm1", 6443, 1)).error.is_none());
+        assert!(r.dispatch(pub_req("vm1", 22, 2)).error.is_none());
+        assert!(r.dispatch(pub_req("vm2", 6443, 3)).error.is_none());
+        assert_eq!(
+            r.dispatch(pub_req("vm3", 6443, 4)).error.map(|e| e.code()),
+            Some("conflict"),
+            "range is full"
+        );
+
+        r.dispatch(Request::new("DetachPort", Some(json!({ "name": "vm1" })), json!(5)));
+        // Both of vm1's slots are back: vm3 can publish the same pair...
+        assert!(r.dispatch(pub_req("vm3", 6443, 6)).error.is_none());
+        assert!(r.dispatch(pub_req("vm3", 22, 7)).error.is_none());
+        // ...and nothing else was freed.
+        assert_eq!(
+            r.dispatch(pub_req("vm4", 6443, 8)).error.map(|e| e.code()),
+            Some("conflict"),
+            "only the detached port's allocations may be freed"
+        );
+        Ok(())
+    }
+
+    /// REQ-010 / VC-06: DeletePort destroys the port together with its
+    /// allocations.
+    #[test]
+    fn delete_port_frees_allocations() -> TestResult {
+        let mut r = Router::new(MemoryControlPlane::with_publish_range(20000, 20001));
+        attached_port(&mut r, "vm1", "02:00:00:00:00:01");
+        attached_port(&mut r, "vm2", "02:00:00:00:00:02");
+        attached_port(&mut r, "vm3", "02:00:00:00:00:03");
+        assert!(r.dispatch(pub_req("vm1", 6443, 1)).error.is_none());
+        assert!(r.dispatch(pub_req("vm2", 6443, 2)).error.is_none());
+        assert_eq!(
+            r.dispatch(pub_req("vm3", 6443, 3)).error.map(|e| e.code()),
+            Some("conflict")
+        );
+
+        r.dispatch(Request::new("DeletePort", Some(json!({ "name": "vm1" })), json!(4)));
+        assert!(
+            r.dispatch(pub_req("vm3", 6443, 5)).error.is_none(),
+            "deleted port's allocation must be reclaimed"
+        );
+        Ok(())
+    }
+
+    /// REQ-010 / VC-06: allocations survive a restart through the persisted
+    /// state store — a control plane restored from disk re-publishes the
+    /// same host_port. Seam pinning: `k8netd_core::state::{StateStore,
+    /// save_to_disk, load_from_disk}` carrying `publish_table`, plus
+    /// `MemoryControlPlane::from_store`.
+    #[test]
+    fn publish_allocations_persist_across_restart() -> TestResult {
+        let dir = std::env::temp_dir().join(format!("k8netd-publish-restart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+
+        // Session 1: publish through the wire seam and capture the result.
+        let mut r = router();
+        attached_port(&mut r, "vm1", "02:00:00:00:00:01");
+        let h1 = host_port_of(r.dispatch(pub_req("vm1", 6443, 1)));
+
+        // Persist exactly what the daemon owns.
+        let mut store = k8netd_core::state::StateStore::default();
+        store
+            .publish_table
+            .entries
+            .insert("vm1".to_string(), BTreeMap::from([(6443u16, h1)]));
+        k8netd_core::state::save_to_disk(&store, &dir)?;
+
+        // Session 2: a fresh daemon loads state.json and re-publishes.
+        let restored = k8netd_core::state::load_from_disk(&dir)?;
+        assert_eq!(
+            restored.publish_table.entries["vm1"][&6443], h1,
+            "publish table must survive the disk round trip"
+        );
+        let mut r2 = Router::new(MemoryControlPlane::from_store(restored));
+        attached_port(&mut r2, "vm1", "02:00:00:00:00:01");
+        let h2 = host_port_of(r2.dispatch(pub_req("vm1", 6443, 2)));
+        assert_eq!(h1, h2, "restored allocator must honor persisted allocations");
+
+        let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
 }
