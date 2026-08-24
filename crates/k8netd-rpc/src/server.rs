@@ -294,7 +294,9 @@ impl ControlPlane for MemoryControlPlane {
         let mac: MacAddr = str_param(params, "mac")?.parse().map_err(|_| RpcError::InvalidParams)?;
         let entry = self.networks.get_mut(net).ok_or(RpcError::NotFound)?;
         let ip = entry.ipam.allocate(mac).map_err(ipam_error)?;
-        Ok(json!({ "ip": ip.to_string() }))
+        // Contract: AllocateIP's result is a bare JSON string carrying the
+        // address, not an object.
+        Ok(Value::String(ip.to_string()))
     }
 
     fn release_ip(&mut self, params: &Value) -> Result<Value, RpcError> {
@@ -585,17 +587,24 @@ mod tests {
                 json!(1),
             ))
         };
-        let ip1 = alloc(&mut r, "02:00:00:00:00:01").result.unwrap()["ip"]
+        // Contract: the result is a bare JSON string carrying the address.
+        let ip1 = alloc(&mut r, "02:00:00:00:00:01")
+            .result
+            .unwrap()
             .as_str()
             .unwrap()
             .to_string();
-        let ip2 = alloc(&mut r, "02:00:00:00:00:02").result.unwrap()["ip"]
+        let ip2 = alloc(&mut r, "02:00:00:00:00:02")
+            .result
+            .unwrap()
             .as_str()
             .unwrap()
             .to_string();
         assert_ne!(ip1, ip2, "distinct MACs get distinct IPs");
         // Reservation is stable across repeated allocations (REQ-004).
-        let again = alloc(&mut r, "02:00:00:00:00:01").result.unwrap()["ip"]
+        let again = alloc(&mut r, "02:00:00:00:00:01")
+            .result
+            .unwrap()
             .as_str()
             .unwrap()
             .to_string();
