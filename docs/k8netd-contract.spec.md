@@ -72,7 +72,9 @@ Ports are single queue pair.
 
 ### REQ-004: IPAM
 AllocateIP(network, mac) returns an IP from the network's pool and binds it
-to the MAC as a DHCP reservation. ReleaseIP(network, mac) frees it. The
+to the MAC as a DHCP reservation. Its result is a bare JSON string carrying
+the address (e.g. `"192.168.124.20"`), not an object. ReleaseIP(network, mac)
+frees it. The
 control-plane IP is reserved before the VM boots so kubeadm/PKI config can
 reference it.
 
