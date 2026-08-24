@@ -17,13 +17,17 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use k8netd_core::ipam::{Ipam, IpamError};
-use k8netd_core::model::{IpPool, MacAddr};
+use k8netd_core::model::{IpPool, MacAddr, PublishTable};
 use k8netd_core::switch::engine::Switch;
 use k8netd_core::switch::mac_table::PortId;
 use k8netd_rpc::protocol::RpcError;
 use k8netd_rpc::server::ControlPlane;
 use k8netd_vhost::port::{PortMessage, PortSink, VhostPort};
 use serde_json::{Value, json};
+
+/// Default inclusive host-port range for the PublishPort allocator
+/// (REQ-010); mirrors the config default.
+const DEFAULT_PUBLISH_RANGE: (u16, u16) = (20_000, 21_000);
 
 /// A live port: control state plus the injection end for its virtqueue.
 /// The delivery end is owned exclusively by the port's pump thread.
@@ -48,6 +52,10 @@ struct Inner {
     /// Switch PortId -> port name, so pumps can resolve flood targets.
     names: BTreeMap<u32, String>,
     switch: Switch,
+    /// Inclusive host-port range the publish allocator hands out (REQ-010).
+    publish_range: (u16, u16),
+    /// Published inbound-forward allocations keyed by port name (REQ-010).
+    publish_table: PublishTable,
 }
 
 /// The full dataplane: control-plane semantics + live frame forwarding.
@@ -60,16 +68,34 @@ pub struct Dataplane {
 #[allow(dead_code)] // wired into main.rs with TASK-031 runtime
 impl Dataplane {
     /// Creates a dataplane rooted at `socket_dir`; port sockets land here.
+    ///
+    /// Restores the persisted publish table (REQ-010) so allocations survive
+    /// a daemon restart; a missing or unreadable state file starts empty.
     pub fn new(socket_dir: impl Into<PathBuf>) -> Self {
+        let socket_dir = socket_dir.into();
+        let publish_table = k8netd_core::state::load_from_disk(&socket_dir)
+            .map(|store| store.publish_table)
+            .unwrap_or_default();
         Dataplane {
-            socket_dir: socket_dir.into(),
+            socket_dir,
             inner: Arc::new(Mutex::new(Inner {
                 networks: BTreeMap::new(),
                 ports: BTreeMap::new(),
                 names: BTreeMap::new(),
                 switch: Switch::new(),
+                publish_range: DEFAULT_PUBLISH_RANGE,
+                publish_table,
             })),
         }
+    }
+
+    /// Persists the publish table to `state.json` (REQ-010 atomic save).
+    fn persist(&self, inner: &Inner) -> Result<(), RpcError> {
+        let store = k8netd_core::state::StateStore {
+            publish_table: inner.publish_table.clone(),
+            ..k8netd_core::state::StateStore::default()
+        };
+        k8netd_core::state::save_to_disk(&store, &self.socket_dir).map_err(|_| RpcError::Internal)
     }
 
     /// Spawns the per-port pump: FromVm frames are learned + forwarded via
@@ -216,6 +242,9 @@ impl ControlPlane for Dataplane {
                 let num = port_num(name);
                 g.switch.remove_port(PortId(num));
                 g.names.remove(&num);
+                // REQ-010: deleting the owning port frees its allocations.
+                g.publish_table.remove_port(name);
+                self.persist(&g)?;
                 // The socket file is removed with the port (REQ-003).
                 let sock = self.socket_dir.join(format!("{name}.sock"));
                 let _ = std::fs::remove_file(sock);
@@ -270,6 +299,9 @@ impl ControlPlane for Dataplane {
         // Socket stays alive across detach (REQ-003); leave the L2 segment.
         p.network = None;
         p.mac = None;
+        // REQ-010: detaching the owning port frees its published allocations.
+        g.publish_table.remove_port(name);
+        self.persist(&g)?;
         Ok(Value::Null)
     }
 
@@ -293,6 +325,31 @@ impl ControlPlane for Dataplane {
         })?;
         Ok(Value::Null)
     }
+
+    fn publish_port(&mut self, params: &Value) -> Result<Value, RpcError> {
+        let port_name = str_p(params, "port")?;
+        let vm_port = u16_p(params, "vm_port")?;
+
+        let mut g = lock(&self.inner)?;
+        // REQ-010: only attached ports are publishable; unknown and
+        // unattached (including since-detached) ports are not_found.
+        let attached = g.ports.get(port_name).map(|p| p.network.is_some()).unwrap_or(false);
+        if !attached {
+            return Err(RpcError::NotFound);
+        }
+
+        // Idempotent re-publish returns the recorded allocation unchanged.
+        let range = g.publish_range;
+        let host_port = match g.publish_table.get(port_name, vm_port) {
+            Some(host) => host,
+            None => g
+                .publish_table
+                .allocate(port_name, vm_port, range)
+                .ok_or(RpcError::Conflict)?, // exhaustion; no partial state
+        };
+        self.persist(&g)?;
+        Ok(json!({ "host_port": host_port }))
+    }
 }
 
 // -- helpers ---------------------------------------------------------------
@@ -300,6 +357,17 @@ impl ControlPlane for Dataplane {
 #[allow(dead_code)]
 fn str_p<'a>(params: &'a Value, key: &str) -> Result<&'a str, RpcError> {
     params.get(key).and_then(Value::as_str).ok_or(RpcError::InvalidParams)
+}
+
+/// Extracts a `u16` parameter, rejecting values outside the u16 domain.
+#[allow(dead_code)]
+fn u16_p(params: &Value, key: &str) -> Result<u16, RpcError> {
+    params
+        .get(key)
+        .and_then(Value::as_u64)
+        .filter(|v| *v <= u64::from(u16::MAX))
+        .map(|v| v as u16)
+        .ok_or(RpcError::InvalidParams)
 }
 
 #[allow(dead_code)]
