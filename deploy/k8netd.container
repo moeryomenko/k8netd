@@ -40,8 +40,8 @@ Restart=always
 # Verified against passt subprocess behavior on the lab host; relax
 # RestrictAddressFamilies first if passt fails to bind its forwards.
 NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=tmpfs
+# No ProtectHome/ProtectSystem: rootless podman needs writable $HOME storage
+# (~/.local/share/containers) and runroot ($XDG_RUNTIME_DIR/containers).
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
 [Install]
