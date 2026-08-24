@@ -15,6 +15,7 @@
 //! Unit tests stub the `passt` binary on PATH (a shell script that records
 //! argv and exits on cue); no real passt is required.
 
+use std::collections::BTreeMap;
 use std::io;
 use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
@@ -61,6 +62,19 @@ pub fn passt_argv(config: &PasstConfig, fd: RawFd) -> Vec<String> {
         argv.push(format!("-t{}:{}/{}", f.host, config.vm_ip, f.vm));
     }
     argv
+}
+
+/// Builds a [`PasstConfig`] whose inbound forwards come only from the port's
+/// published entries (spec REQ-010).
+///
+/// `published` maps vm_port -> host_port — one port's slice of the publish
+/// table. Each entry renders as one `-t<host>:<vm-ip>/<vm>` flag; an empty
+/// map yields no `-t` flags at all. Egress behavior is unaffected.
+pub fn passt_config_for(vm_ip: &str, published: &BTreeMap<u16, u16>) -> PasstConfig {
+    PasstConfig {
+        vm_ip: vm_ip.to_string(),
+        forwards: published.iter().map(|(&vm, &host)| PortForward { host, vm }).collect(),
+    }
 }
 
 /// Encodes `payload` (an Ethernet frame) into a vnet-header-framed buffer.
@@ -200,6 +214,7 @@ impl PasstProc {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::fs;
     use std::os::fd::AsRawFd;
     use std::path::PathBuf;
@@ -411,5 +426,45 @@ mod tests {
             // SAFETY: restoring the saved value captured at stub install time.
             unsafe { std::env::set_var("PATH", &self.old) };
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // TASK-001 (SPEC-CAPISHIM-HYPERVISOR-INTEGRATION REQ-010 / REQ-011 /
+    // VC-06): inbound forwards come from a port's published entries only.
+    // Red phase: pins `passt_config_for(vm_ip, &BTreeMap<u16, u16>)` (map of
+    // vm_port -> host_port, i.e. one port's slice of the publish table).
+    // Compile failure on that seam is the expected red evidence.
+    // -----------------------------------------------------------------------
+
+    /// A port with published entries (6443->6443, 22->22) yields exactly
+    /// `-t6443:<ip>/6443` and `-t22:<ip>/22`; the egress prefix is untouched.
+    #[test]
+    fn published_entries_render_exact_t_args() -> TestResult {
+        let published = BTreeMap::from([(6443u16, 6443u16), (22u16, 22u16)]);
+        let config = passt_config_for("192.168.124.20", &published);
+        let argv = passt_argv(&config, 7);
+
+        let t_args: Vec<&String> = argv.iter().filter(|a| a.starts_with("-t")).collect();
+        assert_eq!(t_args.len(), 2, "one -t arg per published entry");
+        for expected in ["-t22:192.168.124.20/22", "-t6443:192.168.124.20/6443"] {
+            assert!(
+                t_args.iter().any(|a| **a == expected),
+                "published entry must render as {expected}"
+            );
+        }
+        // Egress unchanged: everything before the forwards is the pinned base.
+        assert_eq!(&argv[..5], &["passt", "--fd", "7", "-a", "192.168.124.20"]);
+        Ok(())
+    }
+
+    /// An unpublished port carries no `-t` args at all; egress behavior is
+    /// unchanged (REQ-010).
+    #[test]
+    fn unpublished_port_renders_no_t_args_egress_unchanged() -> TestResult {
+        let config = passt_config_for("192.168.124.20", &BTreeMap::new());
+        let argv = passt_argv(&config, 7);
+        assert_eq!(argv.len(), 5, "no published entries: just the egress prefix");
+        assert!(argv.iter().all(|a| !a.starts_with("-t")));
+        Ok(())
     }
 }
