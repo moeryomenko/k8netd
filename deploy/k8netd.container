@@ -25,11 +25,13 @@ Network=host
 Mount=type=bind,source=/run/user/1000/k8snet,target=/run/user/1000/k8snet
 
 # Explicit pins (grill D7) — every K8NETD_* value stated, no implicit defaults.
+# Inbound forwards come exclusively from the PublishPort RPC (REQ-010/REQ-011);
+# K8NETD_PUBLISH_RANGE bounds the host-port allocator.
 Environment=K8NETD_SOCKET_DIR=/run/user/1000/k8snet
 Environment=K8NETD_PASST_BINARY=passt
 Environment=K8NETD_UPSTREAM_DNS=1.1.1.1,8.8.8.8
 Environment=K8NETD_MTU=1500
-Environment=K8NETD_PORT_FORWARDS=6443,22
+Environment=K8NETD_PUBLISH_RANGE=20000-21000
 
 [Service]
 Restart=always
