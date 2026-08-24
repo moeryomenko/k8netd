@@ -311,7 +311,9 @@ impl ControlPlane for Dataplane {
         let mut g = lock(&self.inner)?;
         let e = g.networks.get_mut(&net).ok_or(RpcError::NotFound)?;
         let ip = e.ipam.allocate(mac).map_err(ipam_err)?;
-        Ok(json!({ "ip": ip.to_string() }))
+        // Contract: AllocateIP's result is a bare JSON string carrying the
+        // address, not an object.
+        Ok(Value::String(ip.to_string()))
     }
 
     fn release_ip(&mut self, params: &Value) -> Result<Value, RpcError> {
