@@ -36,6 +36,11 @@ Environment=K8NETD_PUBLISH_RANGE=20000-21000
 [Service]
 Restart=always
 
+# The bind-mount source must exist before podman creates the container:
+# /run is tmpfs so /run/user/1000/k8snet vanishes across reboots, and
+# podman statfs-fails container creation before k8netd could recreate it.
+ExecStartPre=/usr/bin/mkdir -p /run/user/1000/k8snet
+
 # Conservative hardening on top of an already-rootless container (grill D7).
 # Verified against passt subprocess behavior on the lab host; relax
 # RestrictAddressFamilies first if passt fails to bind its forwards.
