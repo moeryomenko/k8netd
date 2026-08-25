@@ -388,7 +388,11 @@ fn ipam_err(e: IpamError) -> RpcError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use k8netd_vhost::fake_frontend::FakeFrontend;
+    use k8netd_vhost::fake_frontend::{
+        AVAIL_RING_OFFSET, DATA_OFFSET, DESC_TABLE_OFFSET, FakeFrontend, GUEST_BASE, QUEUE_SIZE, USED_RING_OFFSET,
+        VRING_STRIDE,
+    };
+    use k8netd_vhost::port::{RX_VRING, TX_VRING};
 
     type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
@@ -399,9 +403,10 @@ mod tests {
         })
     }
 
-    /// TASK-030 / VC-07: two live ports on one network; a broadcast frame
-    /// emitted by VM-A must be flooded to VM-B through the full stack
-    /// (virtqueue -> pump -> switch -> virtqueue).
+    /// TASK-030 / VC-07 + P15-1: two live ports on one network; a broadcast
+    /// frame emitted by VM-A on its TX vring (index 1) must flow through the
+    /// full stack (TX virtqueue -> pump -> Switch::forward) and reach VM-B
+    /// on its RX vring (index 0).
     #[test]
     fn broadcast_floods_between_two_live_ports() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let dir = std::env::temp_dir().join(format!("k8netd-dp-{}", std::process::id()));
@@ -427,19 +432,27 @@ mod tests {
         let fe1 = FakeFrontend::connect(dir.join("vm1.sock"))?;
         let fe2 = FakeFrontend::connect(dir.join("vm2.sock"))?;
 
-        // VM-A emits a broadcast frame (driver side of port 1).
-        let frame = vec![0xffu8; 60];
-        let addr = 0x1000_0000u64 + 0x3_0000; // DATA_OFFSET scratch area
-        vm_memory::Bytes::write_slice(fe1.mem(), &frame, vm_memory::GuestAddress(addr))?;
-        write_desc_and_kick(fe1.mem(), fe1.kick_fd(), addr, frame.len() as u32)?;
-
-        // VM-B posts a device-writable RX buffer first (driver side of port 2).
-        let rx_addr = 0x1000_0000u64 + 0x3_0000 + 0x1000;
+        // VM-B posts a device-writable RX buffer on its RX vring first.
+        let rx_addr = GUEST_BASE + DATA_OFFSET + 0x1000;
         vm_memory::Bytes::write_slice(fe2.mem(), &[0u8; 128], vm_memory::GuestAddress(rx_addr))?;
-        post_rx_and_kick(fe2.mem(), fe2.kick_fd(), rx_addr)?;
+        post_desc_and_kick(fe2.mem(), fe2.kick_fd(RX_VRING), RX_VRING, 6, rx_addr, 128, 2)?;
 
-        // VM-B must receive it in a used writable buffer.
-        let got = wait_frame(fe2.mem(), Duration::from_secs(5))?;
+        // VM-A emits a broadcast frame on its TX vring.
+        let frame = vec![0xffu8; 60];
+        let tx_addr = GUEST_BASE + DATA_OFFSET;
+        vm_memory::Bytes::write_slice(fe1.mem(), &frame, vm_memory::GuestAddress(tx_addr))?;
+        post_desc_and_kick(
+            fe1.mem(),
+            fe1.kick_fd(TX_VRING),
+            TX_VRING,
+            5,
+            tx_addr,
+            frame.len() as u32,
+            0,
+        )?;
+
+        // VM-B must receive it in a used writable buffer on its RX vring.
+        let got = wait_frame(fe2.mem(), rx_addr, Duration::from_secs(5))?;
         assert_eq!(got, frame, "broadcast must arrive intact at the peer");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -448,59 +461,63 @@ mod tests {
 
     // -- minimal driver-side helpers (mirror port.rs test utilities) -------
 
-    const DESC_TABLE: u64 = 0x0;
-    const AVAIL_RING: u64 = 0x2_0000;
-    const QUEUE_SIZE: u16 = 256;
+    /// Guest-physical base of vring `vring`'s ring area.
+    fn vring_base(vring: usize) -> u64 {
+        GUEST_BASE + u64::try_from(vring).expect("vring index fits u64") * VRING_STRIDE
+    }
 
-    fn write_desc_and_kick(
+    /// Posts one descriptor (no NEXT chaining) into vring `vring`, appends it
+    /// to that vring's avail ring, and rings the kick doorbell.
+    fn post_desc_and_kick(
         mem: &vm_memory::GuestMemoryMmap<()>,
         kick_fd: RawFd,
+        vring: usize,
+        desc_idx: u16,
         buf_addr: u64,
         len: u32,
+        flags: u16,
     ) -> TestResult {
         use vm_memory::{Bytes, GuestAddress};
-        let base = 0x1000_0000u64;
-        // desc 5 (arbitrary free slot): readable buffer at buf_addr.
-        let d = base + DESC_TABLE + 5 * 16;
+        let d = vring_base(vring) + DESC_TABLE_OFFSET + u64::from(desc_idx) * 16;
         mem.write_obj(buf_addr.to_le_bytes(), GuestAddress(d))?;
         mem.write_obj(len.to_le_bytes(), GuestAddress(d + 8))?;
-        mem.write_obj(0u16.to_le_bytes(), GuestAddress(d + 12))?; // no flags
+        mem.write_obj(flags.to_le_bytes(), GuestAddress(d + 12))?;
         mem.write_obj(0u16.to_le_bytes(), GuestAddress(d + 14))?;
-        // avail ring: append idx 5.
-        let idx_addr = GuestAddress(base + AVAIL_RING + 2);
+        let avail = vring_base(vring) + AVAIL_RING_OFFSET;
+        let idx_addr = GuestAddress(avail + 2);
         let cur: u16 = mem.read_obj(idx_addr)?;
-        let slot = GuestAddress(base + AVAIL_RING + 4 + u64::from(cur % QUEUE_SIZE) * 2);
-        mem.write_obj(5u16.to_le_bytes(), slot)?;
+        let slot = GuestAddress(avail + 4 + u64::from(cur % QUEUE_SIZE) * 2);
+        mem.write_obj(desc_idx.to_le_bytes(), slot)?;
         mem.write_obj((cur + 1).to_le_bytes(), idx_addr)?;
-        // kick.
         let val: u64 = 1;
         let n = unsafe { libc::write(kick_fd, &val as *const u64 as *const libc::c_void, 8) };
         assert_eq!(n, 8);
         Ok(())
     }
 
-    /// Polls the used ring for desc 5 and returns the written payload from
-    /// the descriptor's buffer address.
+    /// Polls the RX vring's used ring for the first completion and returns
+    /// the payload written at `buf_addr`.
     fn wait_frame(
         mem: &vm_memory::GuestMemoryMmap<()>,
+        buf_addr: u64,
         timeout: Duration,
     ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
         use vm_memory::{Bytes, GuestAddress};
-        let base = 0x1000_0000u64;
+        let used_ring = vring_base(RX_VRING) + USED_RING_OFFSET;
         let deadline = std::time::Instant::now() + timeout;
         loop {
             if std::time::Instant::now() > deadline {
                 panic!("frame never arrived at peer");
             }
-            let used_idx: u16 = mem.read_obj(GuestAddress(base + 0x1_0000 + 2))?;
+            let used_idx: u16 = mem.read_obj(GuestAddress(used_ring + 2))?;
             if used_idx > 0 {
-                // Used elem 0 -> (desc id, len); read len bytes back from the
-                // buffer that desc 5 pointed at.
-                let id: u32 = mem.read_obj(GuestAddress(base + 0x1_0000 + 4))?;
-                let len: u32 = mem.read_obj(GuestAddress(base + 0x1_0000 + 8))?;
+                // Used elem 0 -> (desc id, len); read len bytes back from
+                // the buffer the posted RX descriptor pointed at.
+                let id: u32 = mem.read_obj(GuestAddress(used_ring + 4))?;
+                let len: u32 = mem.read_obj(GuestAddress(used_ring + 8))?;
                 let _ = id;
                 let mut buf = vec![0u8; len as usize];
-                mem.read_slice(&mut buf, GuestAddress(base + 0x3_0000 + 0x1000))?;
+                mem.read_slice(&mut buf, GuestAddress(buf_addr))?;
                 return Ok(buf);
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -509,24 +526,4 @@ mod tests {
 
     use std::os::fd::RawFd;
     use std::time::Duration;
-
-    /// Posts one device-writable descriptor (idx 6) at `buf_addr` and kicks.
-    fn post_rx_and_kick(mem: &vm_memory::GuestMemoryMmap<()>, kick_fd: RawFd, buf_addr: u64) -> TestResult {
-        use vm_memory::{Bytes, GuestAddress};
-        let base = 0x1000_0000u64;
-        let d = base + DESC_TABLE + 6 * 16;
-        mem.write_obj(buf_addr.to_le_bytes(), GuestAddress(d))?;
-        mem.write_obj(128u32.to_le_bytes(), GuestAddress(d + 8))?;
-        mem.write_obj(2u16.to_le_bytes(), GuestAddress(d + 12))?; // VIRTQ_DESC_F_WRITE
-        mem.write_obj(0u16.to_le_bytes(), GuestAddress(d + 14))?;
-        let idx_addr = GuestAddress(base + AVAIL_RING + 2);
-        let cur: u16 = mem.read_obj(idx_addr)?;
-        let slot = GuestAddress(base + AVAIL_RING + 4 + u64::from(cur % QUEUE_SIZE) * 2);
-        mem.write_obj(6u16.to_le_bytes(), slot)?;
-        mem.write_obj((cur + 1).to_le_bytes(), idx_addr)?;
-        let val: u64 = 1;
-        let n = unsafe { libc::write(kick_fd, &val as *const u64 as *const libc::c_void, 8) };
-        assert_eq!(n, 8);
-        Ok(())
-    }
 }
