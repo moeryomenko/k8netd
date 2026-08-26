@@ -169,6 +169,11 @@ impl MacAddr {
     pub const fn from_bytes(bytes: [u8; 6]) -> Self {
         MacAddr(bytes)
     }
+
+    /// Returns the six octets of the address.
+    pub const fn octets(&self) -> [u8; 6] {
+        self.0
+    }
 }
 
 impl FromStr for MacAddr {

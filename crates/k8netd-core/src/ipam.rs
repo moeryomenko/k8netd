@@ -38,7 +38,11 @@ impl std::error::Error for IpamError {}
 /// MAC as a DHCP reservation; the same MAC always receives the same IP while
 /// its allocation is active. The gateway is never allocated because
 /// `Network::new` rejects pools that contain it.
-#[derive(Debug)]
+///
+/// `Clone` produces an independent snapshot: the DHCP wiring clones the
+/// allocator per exchange so replies always reflect the reservations live at
+/// that moment, without sharing mutable state with the control plane.
+#[derive(Debug, Clone)]
 pub struct Ipam {
     network: Network,
     allocations: HashMap<MacAddr, Ipv4Addr>,
