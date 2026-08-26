@@ -13,6 +13,10 @@
 //! per-upstream timeout) is TASK-017/TASK-031; the test seam is the
 //! `UpstreamSender` trait pinned in the tests module doc comment.
 
+use std::io::ErrorKind;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::time::Duration;
+
 use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
 
 /// A failed attempt against one upstream (pinned by the TASK-016 test seam).
@@ -52,6 +56,51 @@ pub trait UpstreamSender: Send + Sync + 'static {
     /// Sends one raw DNS query to the upstream and returns the raw response
     /// bytes, or an [`UpstreamError`] when the attempt failed.
     fn send(&self, query: &[u8]) -> Result<Vec<u8>, UpstreamError>;
+}
+
+/// Production [`UpstreamSender`]: one UDP exchange against a resolver on
+/// port 53 (spec REQ-006).
+///
+/// Every `send` binds an ephemeral socket, transmits the query, and blocks
+/// for one answer within the per-upstream timeout — the timeout the trait
+/// doc pins ("never block indefinitely"). A silent upstream surfaces as
+/// [`UpstreamError::Timeout`], so the forwarder falls through to its next
+/// upstream or answers SERVFAIL.
+#[derive(Debug, Clone)]
+pub struct UdpUpstream {
+    /// Resolver address queried on every send.
+    addr: SocketAddr,
+    /// Per-exchange read timeout.
+    timeout: Duration,
+}
+
+impl UdpUpstream {
+    /// Creates a sender targeting `ip` on UDP port 53 with a 2-second
+    /// per-exchange timeout.
+    pub fn new(ip: Ipv4Addr) -> Self {
+        UdpUpstream {
+            addr: SocketAddr::from((ip, 53)),
+            timeout: Duration::from_secs(2),
+        }
+    }
+}
+
+impl UpstreamSender for UdpUpstream {
+    fn send(&self, query: &[u8]) -> Result<Vec<u8>, UpstreamError> {
+        let sock = std::net::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0))).map_err(UpstreamError::Io)?;
+        sock.connect(self.addr).map_err(UpstreamError::Io)?;
+        sock.set_read_timeout(Some(self.timeout)).map_err(UpstreamError::Io)?;
+        sock.send(query).map_err(UpstreamError::Io)?;
+        let mut buf = vec![0u8; 4096];
+        match sock.recv(&mut buf) {
+            Ok(n) => {
+                buf.truncate(n);
+                Ok(buf)
+            }
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => Err(UpstreamError::Timeout),
+            Err(e) => Err(UpstreamError::Io(e)),
+        }
+    }
 }
 
 /// A pure DNS forwarder (spec REQ-006, VC-05): no local zones, no caching,
