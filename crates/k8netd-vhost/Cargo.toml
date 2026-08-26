@@ -12,3 +12,4 @@ vhost-user-backend = "0.23.0"
 vm-memory = { version = "0.18.0", features = ["backend-mmap"] }
 vmm-sys-util = "0.15"
 libc = "0.2"
+tracing = "0.1.44"

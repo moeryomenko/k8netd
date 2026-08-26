@@ -412,6 +412,7 @@ name = "k8netd-vhost"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "tracing",
  "vhost",
  "vhost-user-backend",
  "virtio-queue",
