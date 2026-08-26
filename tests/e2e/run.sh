@@ -23,20 +23,39 @@ readonly SOCKET_DIR="${K8NETD_SOCKET_DIR:-/tmp/k8netd-e2e.$$}"
 readonly CONTROL_SOCK="$SOCKET_DIR/control.sock"
 readonly CH_BIN="${CLOUD_HYPERVISOR:-cloud-hypervisor}"
 readonly BASE_IMAGE="${K8NETD_E2E_IMAGE:-}"
-readonly TIMEOUT_S=60
+# CH has no built-in BIOS: disk boots go through the EDK2 firmware shipped
+# alongside the base image (k8labs build layout).
+readonly FIRMWARE="${K8NETD_E2E_FIRMWARE:-$(dirname "$BASE_IMAGE")/CLOUDHV.fd}"
+# Private half of the key baked into the base image's root authorized_keys
+# (k8labs packer-ssh-key; its public half ships beside the image as
+# ssh-lab.pub).
+_default_ssh_key="$(dirname "$BASE_IMAGE")/packer-ssh-key"
+[[ -f "$_default_ssh_key" ]] || _default_ssh_key=/home/eryoma/workspace/k8labs/build/packer-ssh-key
+readonly SSH_KEY="${K8NETD_E2E_SSH_KEY:-$_default_ssh_key}"
+readonly TIMEOUT_S=150
 
 log() { printf '[e2e] %s\n' "$*"; }
 die() { printf '[e2e] FAIL: %s\n' "$*" >&2; exit 1; }
 skip() { printf '[e2e] SKIP: %s\n' "$*" >&2; exit 77; }
-cleanup() { [[ -n "${DAEMON_PID:-}" ]] && kill "$DAEMON_PID" 2>/dev/null || true; }
+# Kill everything this run spawned: leaked cloud-hypervisor children hold an
+# ExclusiveWrite flock on the base image and poison every later run.
+cleanup() {
+	[[ -n "${LOCAL_CH_A:-}" ]] && kill "$LOCAL_CH_A" 2>/dev/null
+	[[ -n "${LOCAL_CH_B:-}" ]] && kill "$LOCAL_CH_B" 2>/dev/null
+	[[ -n "${DAEMON_PID:-}" ]] && kill "$DAEMON_PID" 2>/dev/null
+	true
+}
 trap cleanup EXIT
 
 # --- prerequisites (gate 0) ------------------------------------------------
 command -v "$CH_BIN" >/dev/null 2>&1 || skip "cloud-hypervisor not installed"
 command -v passt >/dev/null 2>&1 || skip "passt not installed"
 [[ -n "$BASE_IMAGE" && -f "$BASE_IMAGE" ]] || skip "base image not set (K8NETD_E2E_IMAGE)"
+[[ -f "$FIRMWARE" ]] || skip "CH firmware not found at $FIRMWARE"
 [[ -w /dev/kvm ]] || skip "/dev/kvm not accessible"
 command -v python3 >/dev/null 2>&1 || skip "python3 needed for JSON-RPC client"
+command -v qemu-img >/dev/null 2>&1 || skip "qemu-img needed for per-VM disk images"
+[[ -f "$SSH_KEY" ]] || skip "image ssh private key not found (K8NETD_E2E_SSH_KEY)"
 
 # --- system-under-test selection (grill D9) --------------------------------
 # Quadlet mode: when the user unit is active, exercise the real deployment
@@ -106,48 +125,99 @@ rpc AttachPort '{"port":"vm-b","network":"net0","mac":"02:00:00:00:00:02"}' >/de
 
 # --- steps 3-5: boot VMs, verify connectivity + forward --------------------
 # Boot commands are lab-specific; the image must run DHCP and expose ssh.
+# Each VM gets its own converted copy of the base image: cloud-hypervisor
+# takes an ExclusiveWrite flock on every writable disk (two VMs cannot share
+# one image file) and its qcow2 parser rejects backing chains (no overlays).
+log "creating per-VM disk images"
+qemu-img convert -O qcow2 "$BASE_IMAGE" "$SOCKET_DIR/vm-a.qcow2"
+qemu-img convert -O qcow2 "$BASE_IMAGE" "$SOCKET_DIR/vm-b.qcow2"
 log "booting VM-A"
 "$CH_BIN" \
-	--cpus 2 --memory size=512M \
-	--disk path="$BASE_IMAGE" \
-	--net vhost_user=true,socket="$SOCKET_DIR/vm-a.sock",num_queues=1,mac="02:00:00:00:00:01" \
+	--cpus boot=2 --memory size=512M,shared=on \
+	--disk path="$SOCKET_DIR/vm-a.qcow2" \
+	--firmware "$FIRMWARE" \
+	--net vhost_user=true,socket="$SOCKET_DIR/vm-a.sock",num_queues=2,mac="02:00:00:00:00:01" \
 	--cmdline "console=ttyS0 root=/dev/vda rw" \
 	>"$SOCKET_DIR/vm-a.log" 2>&1 &
-local_ch_a=$!
+LOCAL_CH_A=$!
 log "booting VM-B"
 "$CH_BIN" \
-	--cpus 2 --memory size=512M \
-	--disk path="$BASE_IMAGE" \
-	--net vhost_user=true,socket="$SOCKET_DIR/vm-b.sock",num_queues=1,mac="02:00:00:00:00:02" \
+	--cpus boot=2 --memory size=512M,shared=on \
+	--disk path="$SOCKET_DIR/vm-b.qcow2" \
+	--firmware "$FIRMWARE" \
+	--net vhost_user=true,socket="$SOCKET_DIR/vm-b.sock",num_queues=2,mac="02:00:00:00:00:02" \
 	--cmdline "console=ttyS0 root=/dev/vda rw" \
 	>"$SOCKET_DIR/vm-b.log" 2>&1 &
-local_ch_b=$!
+LOCAL_CH_B=$!
 
-wait_vm_ssh() { # wait_vm_ssh <ip>
+# Fail fast when a CH instance died at startup (e.g. image lock held by a
+# leaked process from an earlier run) instead of waiting out the DHCP gate.
+sleep 2
+kill -0 "$LOCAL_CH_A" 2>/dev/null || { tail -5 "$SOCKET_DIR/vm-a.log" >&2; die "VM-A cloud-hypervisor exited during boot"; }
+kill -0 "$LOCAL_CH_B" 2>/dev/null || { tail -5 "$SOCKET_DIR/vm-b.log" >&2; die "VM-B cloud-hypervisor exited during boot"; }
+
+SSH_OPTS=(-o StrictHostKeyChecking=no -o ConnectTimeout=2 -o BatchMode=yes -i "$SSH_KEY")
+
+# The guest network lives entirely in k8netd's userspace dataplane: the lab
+# host has no kernel route into 192.168.124.0/24. The only host->guest path
+# is a published forward to the guest's sshd (REQ-008/REQ-010), which this
+# gate setup exercises on purpose.
+log "publishing VM-A ssh forward"
+SSH_FWD=$(rpc PublishPort '{"port":"vm-a","vm_port":22}')
+SSH_PORT=$(printf '%s' "$SSH_FWD" | python3 -c 'import json,sys; print(json.load(sys.stdin)["host_port"])')
+[[ -n "$SSH_PORT" ]] || die "PublishPort returned no host_port for ssh"
+log "ssh forward: 127.0.0.1:$SSH_PORT -> vm-a:22"
+
+vm_ssh() { # vm_ssh <command...>
+	ssh "${SSH_OPTS[@]}" -p "$SSH_PORT" root@127.0.0.1 "$@"
+}
+
+wait_vm_ssh() { # wait_vm_ssh — ssh via the published forward
 	for _ in $(seq 1 "$TIMEOUT_S"); do
-		ssh -o StrictHostKeyChecking=no -o ConnectTimeout=2 -o BatchMode=yes \
-			root@"$1" true 2>/dev/null && return 0
+		vm_ssh true 2>/dev/null && return 0
+		sleep 1
+	done
+	return 1
+}
+
+wait_vm_b() { # wait_vm_b — VM-B is up once it answers pings from VM-A
+	for _ in $(seq 1 "$TIMEOUT_S"); do
+		vm_ssh "ping -c1 -W1 192.168.124.101" >/dev/null 2>&1 && return 0
 		sleep 1
 	done
 	return 1
 }
 
 log "waiting for DHCP on both VMs"
-wait_vm_ssh 192.168.124.101 || die "VM-A never got a lease / ssh"
-wait_vm_ssh 192.168.124.102 || die "VM-B never got a lease / ssh"
+wait_vm_ssh || die "VM-A never got a lease / ssh"
+wait_vm_b || die "VM-B never got a lease / pingable"
 
 log "gate: VM-A -> VM-B ping"
-ssh -o BatchMode=yes root@192.168.124.101 "ping -c2 192.168.124.102" || die "east-west ping failed"
+vm_ssh "ping -c2 192.168.124.101" || die "east-west ping failed"
 
 log "gate: VM-A -> gateway ping"
-ssh -o BatchMode=yes root@192.168.124.101 "ping -c2 192.168.124.1" || die "gateway ping failed"
+vm_ssh "ping -c2 192.168.124.1" || die "gateway ping failed"
+
+log "publishing VM-A 6443 forward"
+PUBLISH_OUT=$(rpc PublishPort '{"port":"vm-a","vm_port":6443}')
+HOST_PORT=$(printf '%s' "$PUBLISH_OUT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["host_port"])')
+[[ -n "$HOST_PORT" ]] || die "PublishPort returned no host_port"
+log "host forward: 127.0.0.1:$HOST_PORT -> vm-a:6443"
 
 log "gate: internet egress through per-VM passt"
-ssh -o BatchMode=yes root@192.168.124.101 "curl -fsS --max-time 10 http://example.com >/dev/null" || die "egress failed"
+vm_ssh "curl -fsS --max-time 10 http://example.com >/dev/null" || die "egress failed"
 
-log "gate: host port-forward 127.0.0.1:6443 -> VM-A"
-ssh -o BatchMode=yes root@192.168.124.101 "nc -l -p 6443 & sleep 0.3; kill \$!" >/dev/null 2>&1 || true
-timeout 5 bash -c 'exec 3<>/dev/tcp/127.0.0.1/6443' || die "6443 forward unreachable"
+log "gate: host port-forward $HOST_PORT -> VM-A"
+vm_ssh "nc -l -p 6443 & sleep 5; kill \$!" >/dev/null 2>&1 &
+NC_PID=$!
+sleep 1
+timeout 5 bash -c "exec 3<>/dev/tcp/127.0.0.1/$HOST_PORT" || {
+	kill "$NC_PID" 2>/dev/null
+	die "$HOST_PORT forward unreachable"
+}
+kill "$NC_PID" 2>/dev/null
+wait "$NC_PID" 2>/dev/null || true
+true
 
 # --- step 6: restart gate (REQ-010, 60s window) ----------------------------
 log "restart gate: killing daemon and restarting within ${TIMEOUT_S}s"
@@ -170,7 +240,15 @@ done
 rpc CreateNetwork '{"name":"net0","cidr":"192.168.124.0/24","gateway":"192.168.124.1","poolStart":"192.168.124.100","poolEnd":"192.168.124.200"}' >/dev/null
 rpc CreatePort '{"name":"vm-a"}' >/dev/null
 rpc AttachPort '{"port":"vm-a","network":"net0","mac":"02:00:00:00:00:01"}' >/dev/null
-ssh -o BatchMode=yes root@192.168.124.101 "ping -c2 192.168.124.102" || die "connectivity lost after restart"
+# Re-create VM-B's port too so its still-running frontend can rejoin the
+# switch; otherwise the east-west ping below has no peer to reach.
+rpc CreatePort '{"name":"vm-b"}' >/dev/null
+rpc AttachPort '{"port":"vm-b","network":"net0","mac":"02:00:00:00:00:02"}' >/dev/null
+# Re-ensure the ssh forward: the publish table survives the restart from
+# state.json (same allocation), but the passt subprocess must be respawned.
+rpc PublishPort '{"port":"vm-a","vm_port":22}' >/dev/null
+sleep 2
+vm_ssh "ping -c2 192.168.124.101" || die "connectivity lost after restart"
 
-kill "$local_ch_a" "$local_ch_b" 2>/dev/null || true
+kill "$LOCAL_CH_A" "$LOCAL_CH_B" 2>/dev/null || true
 log "PASS: all VC-09 gates green"
