@@ -46,8 +46,15 @@ fn main() {
 
     // Dataplane + control plane: one manager binary serving the JSON-RPC
     // control socket; port sockets and the state file live in socket_dir
-    // (spec REQ-001/REQ-010).
-    let dataplane = dataplane::Dataplane::new(&cfg.socket_dir);
+    // (spec REQ-001/REQ-010). The configured resolvers seed the gateway DNS
+    // forwarder (REQ-006) until overridden via set_dns_upstreams.
+    let mut dataplane = dataplane::Dataplane::new(&cfg.socket_dir);
+    dataplane.set_dns_upstreams(
+        cfg.upstream_dns
+            .iter()
+            .map(|ip| Box::new(k8netd_svc::dns::UdpUpstream::new(*ip)) as Box<dyn k8netd_svc::dns::UpstreamSender>)
+            .collect(),
+    );
     let router = k8netd_rpc::server::Router::new(dataplane);
     let control_sock = cfg.socket_dir.join("control.sock");
     tracing::info!(path = %control_sock.display(), "serving control socket");
