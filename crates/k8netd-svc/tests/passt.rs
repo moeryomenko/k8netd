@@ -73,7 +73,7 @@ fn real_passt_spawn_argv_and_terminate() {
     }
 
     // Gate 1 proof: the live process carries the pinned argv fragments
-    // (--fd <n>, -a <vm-ip>, -t host:vm/vm).
+    // (--fd <n>, -a <vm-ip>, -t host:vm, --foreground).
     let cl = cmdline(proc.id()).unwrap_or_default();
     eprintln!("passt argv: {cl}");
     assert!(cl.contains("-a"), "missing -a flag in real passt argv");
@@ -81,9 +81,10 @@ fn real_passt_spawn_argv_and_terminate() {
         cl.contains("192.168.124.20"),
         "missing advertised VM IP in real passt argv"
     );
+    assert!(cl.contains("6443:6443"), "missing port-forward in real passt argv");
     assert!(
-        cl.contains("6443:192.168.124.20/6443"),
-        "missing port-forward in real passt argv"
+        cl.contains("--foreground"),
+        "missing --foreground in real passt argv (default fork-to-background orphans the server)"
     );
 
     // Gate 3: terminate-on-detach via SIGTERM within the grace window.

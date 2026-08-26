@@ -9,8 +9,15 @@
 //! # argv contract (pinned by the integration spec)
 //!
 //! ```text
-//! passt -F <fd> -a <vm-ip> -t <host-port>:<vm-ip>/<vm-port> ...
+//! passt -F <fd> -a <vm-ip> -t <host-port>:<vm-port> ... --foreground
 //! ```
+//!
+//! The `-t` spec is bare `hostport:guestport` — no guest address. Verified
+//! empirically on both passt generations: Debian trixie 0.0~git20250503
+//! (man-page grammar "ports optionally followed by target ports after :")
+//! and host 2026_07_28 accept `-t20010:6443` with rc=0, while an embedded
+//! guest address (`-t<host>:0.0.0.0/<vm>`) is rejected with "Invalid port
+//! specifier". The guest address comes solely from `-a`.
 //!
 //! Unit tests stub the `passt` binary on PATH (a shell script that records
 //! argv and exits on cue); no real passt is required.
@@ -22,14 +29,13 @@ use std::os::unix::net::UnixStream;
 use std::process::{Child, Command};
 use std::time::Duration;
 
-/// Direction byte of the vnet header: VM -> wire (egress).
-pub const VNET_EGRESS: u8 = 0x01;
-/// Direction byte of the vnet header: wire -> VM (ingress).
-pub const VNET_INGRESS: u8 = 0x02;
-/// Vnet header size: 1 direction byte + 1 reserved + 2 big-endian length.
-pub const VNET_HEADER_LEN: usize = 4;
+/// Frame header size on the passt `-F` socket: a big-endian u32 byte
+/// length prefixing each raw Ethernet frame (passt's UNIX tap protocol;
+/// verified against passt 2026_07_28 — frames we write are guest -> wire,
+/// frames we read are wire -> guest).
+pub const FRAME_HEADER_LEN: usize = 4;
 
-/// One TCP port-forward rendered as `-t <host>:<vm-ip>/<vm>`.
+/// One TCP port-forward rendered as `-t <host>:<vm>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortForward {
     /// Host-side TCP port.
@@ -59,8 +65,22 @@ pub fn passt_argv(config: &PasstConfig, fd: RawFd) -> Vec<String> {
         config.vm_ip.clone(),
     ];
     for f in &config.forwards {
-        argv.push(format!("-t{}:{}/{}", f.host, config.vm_ip, f.vm));
+        // Bare `hostport:guestport`: verified empirically on BOTH passt
+        // generations — Debian trixie 0.0~git20250503 (man-page grammar
+        // "ports optionally followed by target ports after :") and host
+        // 2026_07_28 accept `-t20010:6443` with rc=0; embedding a guest
+        // address is rejected ("Invalid port specifier"). The guest address
+        // is pinned by `-a` above.
+        argv.push(format!("-t{}:{}", f.host, f.vm));
     }
+    // passt forks into background by default (man: "-f, --foreground: Don't
+    // run in background... Default is to fork into background"). Without this
+    // flag the PID we spawn is only a short-lived wrapper: the supervisor
+    // reads its exit as death and respawns, and every respawn collides with
+    // the orphaned fork still holding the published ports ("Failed to bind
+    // port ... (Address already in use)"). Foreground mode keeps the tracked
+    // PID identical to the serving process.
+    argv.push("--foreground".to_string());
     argv
 }
 
@@ -68,8 +88,10 @@ pub fn passt_argv(config: &PasstConfig, fd: RawFd) -> Vec<String> {
 /// published entries (spec REQ-010).
 ///
 /// `published` maps vm_port -> host_port — one port's slice of the publish
-/// table. Each entry renders as one `-t<host>:<vm-ip>/<vm>` flag; an empty
-/// map yields no `-t` flags at all. Egress behavior is unaffected.
+/// table; an empty map yields no `-t` flags at all. Egress behavior is
+/// unaffected.
+///
+/// Each entry renders as one `-t<host>:<vm>` flag.
 pub fn passt_config_for(vm_ip: &str, published: &BTreeMap<u16, u16>) -> PasstConfig {
     PasstConfig {
         vm_ip: vm_ip.to_string(),
@@ -77,52 +99,50 @@ pub fn passt_config_for(vm_ip: &str, published: &BTreeMap<u16, u16>) -> PasstCon
     }
 }
 
-/// Encodes `payload` (an Ethernet frame) into a vnet-header-framed buffer.
-pub fn encode_vnet(direction: u8, payload: &[u8]) -> Vec<u8> {
-    let len = payload.len() as u16;
-    let mut out = Vec::with_capacity(VNET_HEADER_LEN + payload.len());
-    out.push(direction);
-    out.push(0);
-    out.extend_from_slice(&len.to_be_bytes());
+/// Encodes `payload` (an Ethernet frame) for the passt `-F` socket:
+/// big-endian u32 length prefix followed by the raw frame.
+pub fn encode_frame(payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(FRAME_HEADER_LEN + payload.len());
+    out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
     out.extend_from_slice(payload);
     out
 }
 
-/// Decodes a vnet-header-framed buffer into `(direction, payload)`.
-///
-/// Errors when the buffer is shorter than the header or truncated against
-/// the declared length.
-pub fn decode_vnet(buf: &[u8]) -> Result<(u8, &[u8]), VnetError> {
-    if buf.len() < VNET_HEADER_LEN {
+/// Decodes one length-prefixed frame from the head of `buf`, returning the
+/// payload. Errors when the buffer is shorter than the header or truncated
+/// against the declared length.
+pub fn decode_frame(buf: &[u8]) -> Result<&[u8], VnetError> {
+    if buf.len() < FRAME_HEADER_LEN {
         return Err(VnetError::TooShort(buf.len()));
     }
-    let direction = buf[0];
-    let len = u16::from_be_bytes([buf[2], buf[3]]) as usize;
-    let end = VNET_HEADER_LEN.checked_add(len).ok_or(VnetError::TooShort(buf.len()))?;
+    let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    let end = FRAME_HEADER_LEN
+        .checked_add(len)
+        .ok_or(VnetError::TooShort(buf.len()))?;
     if buf.len() < end {
         return Err(VnetError::Truncated {
-            declared: len as u16,
-            have: buf.len() - VNET_HEADER_LEN,
+            declared: len,
+            have: buf.len() - FRAME_HEADER_LEN,
         });
     }
-    Ok((direction, &buf[VNET_HEADER_LEN..end]))
+    Ok(&buf[FRAME_HEADER_LEN..end])
 }
 
-/// vnet framing decode failures.
+/// passt socket framing decode failures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VnetError {
     /// Buffer shorter than the 4-byte header.
     TooShort(usize),
     /// Declared payload length exceeds the bytes present.
-    Truncated { declared: u16, have: usize },
+    Truncated { declared: usize, have: usize },
 }
 
 impl std::fmt::Display for VnetError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            VnetError::TooShort(n) => write!(f, "vnet buffer too short: {n} bytes"),
+            VnetError::TooShort(n) => write!(f, "passt buffer too short: {n} bytes"),
             VnetError::Truncated { declared, have } => {
-                write!(f, "vnet frame truncated: declared {declared}, have {have}")
+                write!(f, "passt frame truncated: declared {declared}, have {have}")
             }
         }
     }
@@ -251,7 +271,8 @@ mod tests {
                 "7",
                 "-a",
                 "192.168.124.20",
-                "-t6443:192.168.124.20/6443"
+                "-t6443:6443",
+                "--foreground"
             ]
         );
         Ok(())
@@ -262,9 +283,9 @@ mod tests {
     fn argv_multiple_forwards_in_order() -> TestResult {
         let argv = passt_argv(&cfg(&[(6443, 6443), (22, 2222)]), 9);
         assert_eq!(&argv[..5], &["passt", "--fd", "9", "-a", "192.168.124.20"]);
-        assert_eq!(argv[5], "-t6443:192.168.124.20/6443");
-        assert_eq!(argv[6], "-t22:192.168.124.20/2222");
-        assert_eq!(argv.len(), 7);
+        assert_eq!(argv[5], "-t6443:6443");
+        assert_eq!(argv[6], "-t22:2222");
+        assert_eq!(argv.len(), 8);
         Ok(())
     }
 
@@ -272,36 +293,31 @@ mod tests {
     #[test]
     fn argv_without_forwards_has_no_t_flags() -> TestResult {
         let argv = passt_argv(&cfg(&[]), 3);
-        assert_eq!(argv.len(), 5);
+        assert_eq!(argv.len(), 6);
         assert!(argv.iter().all(|a| !a.starts_with("-t")));
         Ok(())
     }
 
-    /// vnet framing round-trips egress and ingress payloads exactly.
+    /// passt socket framing round-trips payloads exactly.
     #[test]
-    fn vnet_round_trip_both_directions() -> TestResult {
+    fn frame_round_trip() -> TestResult {
         let frame = make_frame(64);
-        for dir in [VNET_EGRESS, VNET_INGRESS] {
-            let encoded = encode_vnet(dir, &frame);
-            assert_eq!(encoded.len(), VNET_HEADER_LEN + frame.len());
-            let (d, payload) = decode_vnet(&encoded)?;
-            assert_eq!(d, dir);
-            assert_eq!(payload, &frame[..]);
-        }
+        let encoded = encode_frame(&frame);
+        assert_eq!(encoded.len(), FRAME_HEADER_LEN + frame.len());
+        assert_eq!(&encoded[..FRAME_HEADER_LEN], &(frame.len() as u32).to_be_bytes());
+        let payload = decode_frame(&encoded)?;
+        assert_eq!(payload, &frame[..]);
         Ok(())
     }
 
     /// Framing rejects short buffers and truncation against declared length.
     #[test]
-    fn vnet_rejects_short_and_truncated() -> TestResult {
-        assert_eq!(decode_vnet(&[0u8; 3]), Err(VnetError::TooShort(3)));
+    fn frame_rejects_short_and_truncated() -> TestResult {
+        assert_eq!(decode_frame(&[0u8; 3]), Err(VnetError::TooShort(3)));
         // Declares 200 payload bytes but carries none.
-        let bad = encode_vnet(VNET_INGRESS, &[]);
-        let mut trunc = bad.clone();
-        trunc[2] = 0;
-        trunc[3] = 200;
+        let mut trunc = (200u32).to_be_bytes().to_vec();
         assert_eq!(
-            decode_vnet(&trunc),
+            decode_frame(&trunc),
             Err(VnetError::Truncated { declared: 200, have: 0 })
         );
         Ok(())
@@ -437,7 +453,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// A port with published entries (6443->6443, 22->22) yields exactly
-    /// `-t6443:<ip>/6443` and `-t22:<ip>/22`; the egress prefix is untouched.
+    /// `-t6443:6443` and `-t22:22`; the egress prefix is
+    /// untouched.
     #[test]
     fn published_entries_render_exact_t_args() -> TestResult {
         let published = BTreeMap::from([(6443u16, 6443u16), (22u16, 22u16)]);
@@ -446,7 +463,7 @@ mod tests {
 
         let t_args: Vec<&String> = argv.iter().filter(|a| a.starts_with("-t")).collect();
         assert_eq!(t_args.len(), 2, "one -t arg per published entry");
-        for expected in ["-t22:192.168.124.20/22", "-t6443:192.168.124.20/6443"] {
+        for expected in ["-t22:22", "-t6443:6443"] {
             assert!(
                 t_args.iter().any(|a| **a == expected),
                 "published entry must render as {expected}"
@@ -463,7 +480,7 @@ mod tests {
     fn unpublished_port_renders_no_t_args_egress_unchanged() -> TestResult {
         let config = passt_config_for("192.168.124.20", &BTreeMap::new());
         let argv = passt_argv(&config, 7);
-        assert_eq!(argv.len(), 5, "no published entries: just the egress prefix");
+        assert_eq!(argv.len(), 6, "no published entries: egress prefix plus --foreground");
         assert!(argv.iter().all(|a| !a.starts_with("-t")));
         Ok(())
     }
