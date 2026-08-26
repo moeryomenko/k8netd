@@ -629,10 +629,20 @@ fn service_reply(g: &Inner, port: &str, frame: &[u8]) -> Option<Vec<u8>> {
             .get(16..20)
             .map(|o| Ipv4Addr::new(o[0], o[1], o[2], o[3]))
             .unwrap_or(Ipv4Addr::UNSPECIFIED);
-        tracing::info!(port, mac = %vm_mac, yiaddr = %yiaddr, "dhcp lease served");
+        // TASK-005: DHCP replies are Ethernet-addressed to the sender MAC
+        // parsed from the request's Ethernet source (the guest's actual
+        // NIC), not the port's pinned MAC; a NAK (yiaddr unspecified) is
+        // broadcast by the wrapper. The Ethernet source is always present
+        // here (a DHCP request that reached the handler is >= 14+20+8+240
+        // bytes); the fallback keeps the old addressing for runts.
+        let sender_mac = frame
+            .get(6..12)
+            .and_then(|m| <[u8; 6]>::try_from(m).ok())
+            .unwrap_or_else(|| vm_mac.octets());
+        tracing::info!(port, mac = %hex_prefix(&sender_mac), yiaddr = %yiaddr, "dhcp lease served");
         return Some(wrap_udp_reply(
             &reply,
-            vm_mac,
+            MacAddr::from_bytes(sender_mac),
             gateway_ip,
             yiaddr,
             DHCP_SERVER_PORT,
@@ -977,10 +987,16 @@ fn inet_checksum(data: &[u8]) -> u16 {
 }
 
 /// Wraps a service reply payload (DHCP packet or DNS message) into a full
-/// Ethernet/IPv4/UDP frame from the gateway to the VM: unicast to the VM's
-/// MAC, source MAC derived from the gateway IP (REQ-007), IPv4 header
-/// checksummed, UDP checksum zero (legal over IPv4). `reply_ip` selects the
-/// destination IP: the offered address when present, broadcast otherwise.
+/// Ethernet/IPv4/UDP frame from the gateway to the VM: source MAC derived
+/// from the gateway IP (REQ-007), IPv4 header checksummed, UDP checksum
+/// zero (legal over IPv4). `reply_ip` selects the destination IP: the
+/// offered address when present, broadcast otherwise. The Ethernet
+/// destination is `vm_mac` — for DHCP the request's sender MAC, for other
+/// services the port's pinned MAC — except that an unspecified `reply_ip`
+/// (a DHCP NAK) is broadcast at the Ethernet and IP destination layers so
+/// a guest whose NIC MAC differs from the pinned MAC still receives it;
+/// the IP source stays the gateway (a broadcast source is dropped as a
+/// martian by Linux before UDP delivery) (TASK-005).
 fn wrap_udp_reply(
     payload: &[u8],
     vm_mac: MacAddr,
@@ -994,9 +1010,14 @@ fn wrap_udp_reply(
     } else {
         reply_ip
     };
+    let dst_mac = if reply_ip.is_unspecified() {
+        [0xff; 6]
+    } else {
+        vm_mac.octets()
+    };
     let udp_len = 8 + payload.len();
     let mut out = Vec::with_capacity(14 + 20 + udp_len);
-    out.extend_from_slice(&vm_mac.octets());
+    out.extend_from_slice(&dst_mac);
     out.extend_from_slice(&gateway_mac(gateway_ip));
     out.extend_from_slice(&ETHERTYPE_IPV4.to_be_bytes());
 
@@ -2171,6 +2192,352 @@ cat <&$FD > "$ROOT/egress.bin"
         Ok(())
     }
 
+    // >>> TASK-004-DHCP-ADDRESSING (red phase). Pins the DHCP reply
+    // addressing fix: OFFER/ACK/NAK must be Ethernet-addressed to the DHCP
+    // packet's sender MAC (the guest's actual NIC), not unconditionally to
+    // the port's pinned MAC; a NAK (yiaddr 0.0.0.0) must go to the Ethernet
+    // broadcast address so a guest whose NIC MAC differs still receives it.
+    // Non-DHCP service replies keep the pinned-MAC addressing (see the DNS
+    // test below). Red modes: the OFFER/ACK/NAK tests are runtime-red today
+    // (service_reply/wrap_udp_reply address every reply to lp.mac); the
+    // wrap_udp_reply seam test is runtime-red on the Ethernet destination.
+
+    /// Req 1 + edge: a DHCP DISCOVER whose Ethernet source differs from the
+    /// port's pinned MAC must be answered with an OFFER Ethernet-addressed
+    /// to THAT sender MAC (the guest's actual NIC), not to lp.mac.
+    #[test]
+    fn dhcp_offer_addressed_to_sender_mac_when_different_from_port_mac() -> TestResult {
+        let dir = passt_temp_root("dhcp-offer-sender");
+        std::fs::create_dir_all(&dir)?;
+        let (mut dp, _ip) = attached_dp(&dir, "vm9", "02:00:00:00:00:09")?;
+
+        let fe = FakeFrontend::connect(dir.join("vm9.sock"))?;
+        let mem = fe.mem().clone();
+
+        let tx_addr = GUEST_BASE + DATA_OFFSET;
+        let rx0 = GUEST_BASE + DATA_OFFSET + 0x1000;
+        {
+            use vm_memory::Bytes;
+            mem.write_slice(&[0u8; 512], vm_memory::GuestAddress(rx0))?;
+        }
+
+        // The guest's actual NIC MAC (02:00:00:00:00:0a) differs from the
+        // port's pinned MAC (02:00:00:00:00:09). The DISCOVER's Ethernet
+        // source and chaddr are the guest MAC; the OFFER must be
+        // Ethernet-addressed to that MAC so the guest's NIC accepts it.
+        let guest_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x0a];
+        let discover = udp_over_eth(
+            &[0xff; 6],
+            &guest_mac,
+            [0, 0, 0, 0],
+            [255, 255, 255, 255],
+            68,
+            67,
+            &dhcp_packet(1, 0x1122_3344, &guest_mac, None),
+        );
+        {
+            use vm_memory::Bytes;
+            mem.write_slice(&encode_driver_tx(&discover), vm_memory::GuestAddress(tx_addr))?;
+        }
+        post_desc_and_kick(&mem, fe.kick_fd(RX_VRING), RX_VRING, 6, rx0, 512, 2)?;
+        post_desc_and_kick(
+            &mem,
+            fe.kick_fd(TX_VRING),
+            TX_VRING,
+            5,
+            tx_addr,
+            (discover.len() + VNET_HDR_LEN) as u32,
+            0,
+        )?;
+
+        let offer_len = wait_used_elem_len(&mem, 0, Duration::from_secs(5))? as usize;
+        assert!(
+            offer_len >= VNET_HDR_LEN + 14 + 20 + 8 + 240,
+            "no DHCP OFFER reached the VM (RX completion carried {offer_len} bytes)"
+        );
+        let offer_frame = {
+            use vm_memory::Bytes;
+            let mut buf = vec![0u8; offer_len];
+            mem.read_slice(&mut buf, vm_memory::GuestAddress(rx0))?;
+            decode_driver_rx(&buf)
+                .map(|f| f.to_vec())
+                .ok_or("no vnet header on OFFER")?
+        };
+        let offer = parse_dhcp_reply(&offer_frame).expect("OFFER frame with a DHCP payload");
+        assert_eq!(offer.msg_type, Some(2), "first reply must be an OFFER");
+        assert_ne!(offer.yiaddr, [0, 0, 0, 0], "OFFER must carry an address (unicast path)");
+        assert_eq!(
+            &offer_frame[0..6],
+            &guest_mac,
+            "OFFER must be Ethernet-addressed to the DHCP sender MAC, not the port's pinned MAC"
+        );
+        assert_ne!(
+            &offer_frame[0..6],
+            &DP_VM_MAC,
+            "OFFER must not be addressed to the port's pinned MAC"
+        );
+
+        drop(fe);
+        let _ = dp.delete_port(&serde_json::json!({"name": "vm9"}));
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Req 1 + edge: the normal ACK path (yiaddr set) must also be unicast
+    /// to the DHCP sender MAC when it differs from the port's pinned MAC.
+    #[test]
+    fn dhcp_ack_addressed_to_sender_mac_when_different_from_port_mac() -> TestResult {
+        let dir = passt_temp_root("dhcp-ack-sender");
+        std::fs::create_dir_all(&dir)?;
+        let (mut dp, _ip) = attached_dp(&dir, "vm9", "02:00:00:00:00:09")?;
+
+        // Reserve an IP for the guest's actual NIC MAC so the REQUEST can be
+        // ACK'd: the DHCP wiring clones the IPAM per exchange (independent
+        // snapshot), so a DISCOVER-time allocation would not persist to the
+        // REQUEST's fresh server.
+        let guest_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x0a];
+        let guest_ip = dp
+            .allocate_ip(&serde_json::json!({"network": "net0", "mac": "02:00:00:00:00:0a"}))
+            .map_err(|e| format!("allocate_ip: {e:?}"))?;
+        let guest_reserved = ipv4_octets(guest_ip.as_str().expect("bare ip string"));
+
+        let fe = FakeFrontend::connect(dir.join("vm9.sock"))?;
+        let mem = fe.mem().clone();
+
+        let tx_addr = GUEST_BASE + DATA_OFFSET;
+        let rx0 = GUEST_BASE + DATA_OFFSET + 0x1000;
+        let rx1 = GUEST_BASE + DATA_OFFSET + 0x1800;
+        {
+            use vm_memory::Bytes;
+            mem.write_slice(&[0u8; 512], vm_memory::GuestAddress(rx0))?;
+            mem.write_slice(&[0u8; 512], vm_memory::GuestAddress(rx1))?;
+        }
+
+        // DISCOVER -> OFFER (yiaddr set).
+        let discover = udp_over_eth(
+            &[0xff; 6],
+            &guest_mac,
+            [0, 0, 0, 0],
+            [255, 255, 255, 255],
+            68,
+            67,
+            &dhcp_packet(1, 0x1122_3344, &guest_mac, None),
+        );
+        {
+            use vm_memory::Bytes;
+            mem.write_slice(&encode_driver_tx(&discover), vm_memory::GuestAddress(tx_addr))?;
+        }
+        post_desc_and_kick(&mem, fe.kick_fd(RX_VRING), RX_VRING, 6, rx0, 512, 2)?;
+        post_desc_and_kick(
+            &mem,
+            fe.kick_fd(TX_VRING),
+            TX_VRING,
+            5,
+            tx_addr,
+            (discover.len() + VNET_HDR_LEN) as u32,
+            0,
+        )?;
+
+        let offer_len = wait_used_elem_len(&mem, 0, Duration::from_secs(5))? as usize;
+        assert!(
+            offer_len >= VNET_HDR_LEN + 14 + 20 + 8 + 240,
+            "no DHCP OFFER reached the VM (RX completion carried {offer_len} bytes)"
+        );
+        let offer_frame = {
+            use vm_memory::Bytes;
+            let mut buf = vec![0u8; offer_len];
+            mem.read_slice(&mut buf, vm_memory::GuestAddress(rx0))?;
+            decode_driver_rx(&buf)
+                .map(|f| f.to_vec())
+                .ok_or("no vnet header on OFFER")?
+        };
+        let offer = parse_dhcp_reply(&offer_frame).expect("OFFER frame with a DHCP payload");
+        assert_eq!(offer.msg_type, Some(2), "first reply must be an OFFER");
+        assert_eq!(
+            offer.yiaddr, guest_reserved,
+            "OFFER must carry the guest MAC's reservation"
+        );
+
+        // REQUEST -> ACK (yiaddr set).
+        let request = udp_over_eth(
+            &[0xff; 6],
+            &guest_mac,
+            [0, 0, 0, 0],
+            [255, 255, 255, 255],
+            68,
+            67,
+            &dhcp_packet(3, 0x1122_3344, &guest_mac, Some(offer.yiaddr)),
+        );
+        {
+            use vm_memory::Bytes;
+            mem.write_slice(&encode_driver_tx(&request), vm_memory::GuestAddress(tx_addr))?;
+        }
+        post_desc_and_kick(&mem, fe.kick_fd(RX_VRING), RX_VRING, 7, rx1, 512, 2)?;
+        post_desc_and_kick(
+            &mem,
+            fe.kick_fd(TX_VRING),
+            TX_VRING,
+            6,
+            tx_addr,
+            (request.len() + VNET_HDR_LEN) as u32,
+            0,
+        )?;
+
+        let ack_len = wait_used_elem_len(&mem, 1, Duration::from_secs(5))? as usize;
+        assert!(
+            ack_len >= VNET_HDR_LEN + 14 + 20 + 8 + 240,
+            "no DHCP ACK reached the VM (RX completion carried {ack_len} bytes)"
+        );
+        let ack_frame = {
+            use vm_memory::Bytes;
+            let mut buf = vec![0u8; ack_len];
+            mem.read_slice(&mut buf, vm_memory::GuestAddress(rx1))?;
+            decode_driver_rx(&buf)
+                .map(|f| f.to_vec())
+                .ok_or("no vnet header on ACK")?
+        };
+        let ack = parse_dhcp_reply(&ack_frame).expect("ACK frame with a DHCP payload");
+        assert_eq!(ack.msg_type, Some(5), "second reply must be an ACK");
+        assert_eq!(ack.yiaddr, offer.yiaddr, "ACK must carry the offered address");
+        assert_eq!(
+            &ack_frame[0..6],
+            &guest_mac,
+            "ACK must be Ethernet-addressed to the DHCP sender MAC, not the port's pinned MAC"
+        );
+        assert_ne!(
+            &ack_frame[0..6],
+            &DP_VM_MAC,
+            "ACK must not be addressed to the port's pinned MAC"
+        );
+
+        drop(fe);
+        let _ = dp.delete_port(&serde_json::json!({"name": "vm9"}));
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Req 2 + edge: a REQUEST that yields a NAK (yiaddr 0.0.0.0) must be
+    /// answered with an Ethernet-broadcast frame so a guest whose NIC MAC
+    /// differs from the port's pinned MAC still receives the NAK.
+    #[test]
+    fn dhcp_nak_uses_ethernet_broadcast() -> TestResult {
+        let dir = passt_temp_root("dhcp-nak-bcast");
+        std::fs::create_dir_all(&dir)?;
+        let (mut dp, ip) = attached_dp(&dir, "vm9", "02:00:00:00:00:09")?;
+        let reserved = ipv4_octets(&ip);
+
+        let fe = FakeFrontend::connect(dir.join("vm9.sock"))?;
+        let mem = fe.mem().clone();
+
+        let tx_addr = GUEST_BASE + DATA_OFFSET;
+        let rx0 = GUEST_BASE + DATA_OFFSET + 0x1000;
+        {
+            use vm_memory::Bytes;
+            mem.write_slice(&[0u8; 512], vm_memory::GuestAddress(rx0))?;
+        }
+
+        // The guest's NIC MAC differs from the port's pinned MAC; it
+        // REQUESTs the IP reserved to the port's pinned MAC, which the
+        // server NAKs (the requested IP is not bound to the requesting
+        // chaddr). The NAK's yiaddr is 0.0.0.0, so the reply must be
+        // Ethernet-broadcast.
+        let guest_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x0a];
+        let request = udp_over_eth(
+            &[0xff; 6],
+            &guest_mac,
+            [0, 0, 0, 0],
+            [255, 255, 255, 255],
+            68,
+            67,
+            &dhcp_packet(3, 0x1122_3344, &guest_mac, Some(reserved)),
+        );
+        {
+            use vm_memory::Bytes;
+            mem.write_slice(&encode_driver_tx(&request), vm_memory::GuestAddress(tx_addr))?;
+        }
+        post_desc_and_kick(&mem, fe.kick_fd(RX_VRING), RX_VRING, 6, rx0, 512, 2)?;
+        post_desc_and_kick(
+            &mem,
+            fe.kick_fd(TX_VRING),
+            TX_VRING,
+            5,
+            tx_addr,
+            (request.len() + VNET_HDR_LEN) as u32,
+            0,
+        )?;
+
+        let nak_len = wait_used_elem_len(&mem, 0, Duration::from_secs(5))? as usize;
+        assert!(
+            nak_len >= VNET_HDR_LEN + 14 + 20 + 8 + 240,
+            "no DHCP NAK reached the VM (RX completion carried {nak_len} bytes)"
+        );
+        let nak_frame = {
+            use vm_memory::Bytes;
+            let mut buf = vec![0u8; nak_len];
+            mem.read_slice(&mut buf, vm_memory::GuestAddress(rx0))?;
+            decode_driver_rx(&buf)
+                .map(|f| f.to_vec())
+                .ok_or("no vnet header on NAK")?
+        };
+        let nak = parse_dhcp_reply(&nak_frame).expect("NAK frame with a DHCP payload");
+        assert_eq!(nak.msg_type, Some(6), "reply must be a NAK");
+        assert_eq!(nak.yiaddr, [0, 0, 0, 0], "a NAK must not carry an address");
+        assert_eq!(
+            &nak_frame[0..6],
+            &[0xff; 6],
+            "NAK must be Ethernet-broadcast (ff:ff:ff:ff:ff:ff) so a guest whose NIC MAC differs still receives it"
+        );
+        assert_eq!(
+            &nak_frame[30..34],
+            &[255, 255, 255, 255],
+            "NAK must keep the IP-broadcast destination"
+        );
+        assert_eq!(
+            &nak_frame[26..30],
+            &DP_GW_IP_OCTETS,
+            "NAK must keep the gateway as the IP source (a broadcast source is dropped as martian)"
+        );
+
+        drop(fe);
+        let _ = dp.delete_port(&serde_json::json!({"name": "vm9"}));
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Edge (defensive path): at the addressing seam, an unspecified reply
+    /// IP (yiaddr 0.0.0.0, e.g. a NAK) must produce an Ethernet-broadcast
+    /// frame regardless of the MAC passed in. The sender-MAC parse failure
+    /// itself is unreachable through the full stack (a DHCP request that
+    /// reaches the handler is always >= 14+20+8+240 bytes, so the Ethernet
+    /// source is always present); this pins the defensive broadcast at the
+    /// seam that the fix must implement.
+    #[test]
+    fn wrap_udp_reply_broadcasts_ethernet_when_reply_ip_unspecified() {
+        let frame = wrap_udp_reply(
+            &[0u8; 240],
+            MacAddr::from_bytes(DP_VM_MAC),
+            Ipv4Addr::new(192, 168, 124, 1),
+            Ipv4Addr::UNSPECIFIED,
+            DHCP_SERVER_PORT,
+            DHCP_CLIENT_PORT,
+        );
+        assert_eq!(
+            &frame[0..6],
+            &[0xff; 6],
+            "an unspecified reply IP must yield an Ethernet-broadcast destination"
+        );
+        assert_eq!(
+            &frame[30..34],
+            &[255, 255, 255, 255],
+            "an unspecified reply IP must keep the IP-broadcast destination"
+        );
+        assert_eq!(
+            &frame[26..30],
+            &[192, 168, 124, 1],
+            "an unspecified reply IP must keep the gateway as the IP source (a broadcast source is dropped as martian)"
+        );
+    }
+
     // >>> TASK-004-DNS-SEAM (compile-red until Dataplane::set_dns_upstreams lands)
 
     /// Upstream stub for the DNS seam: records every relayed query and
@@ -2273,6 +2640,95 @@ cat <&$FD > "$ROOT/egress.bin"
             dns_payload,
             &expected[..],
             "upstream answer relayed byte-for-byte to the VM"
+        );
+
+        drop(fe);
+        let _ = dp.delete_port(&serde_json::json!({"name": "vm9"}));
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Req 3 + edge: a non-DHCP service reply (DNS) must keep the current
+    /// addressing — Ethernet destination = the port's pinned MAC — even when
+    /// the query's Ethernet source differs from lp.mac. The DHCP sender-MAC
+    /// addressing must not leak into the non-DHCP path.
+    #[test]
+    fn dns_reply_keeps_port_mac_addressing_for_non_dhcp() -> TestResult {
+        let dir = passt_temp_root("dns-lpmac");
+        std::fs::create_dir_all(&dir)?;
+        let (mut dp, _ip) = attached_dp(&dir, "vm9", "02:00:00:00:00:09")?;
+        let (upstream, _sent) = {
+            let shared = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            (
+                RecordingUpstream {
+                    sent: std::sync::Arc::clone(&shared),
+                },
+                shared,
+            )
+        };
+        dp.set_dns_upstreams(vec![Box::new(upstream)]);
+
+        let fe = FakeFrontend::connect(dir.join("vm9.sock"))?;
+        let mem = fe.mem().clone();
+
+        let tx_addr = GUEST_BASE + DATA_OFFSET;
+        let rx0 = GUEST_BASE + DATA_OFFSET + 0x1000;
+        {
+            use vm_memory::Bytes;
+            mem.write_slice(&[0u8; 512], vm_memory::GuestAddress(rx0))?;
+        }
+
+        // The query's Ethernet source is a guest MAC that differs from the
+        // port's pinned MAC; the DNS answer must still be addressed to the
+        // pinned MAC (non-DHCP addressing is unchanged).
+        let guest_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x0a];
+        let query = dns_query_bytes(0x4242);
+        let qframe = udp_over_eth(
+            &DP_GW_MAC,
+            &guest_mac,
+            [192, 168, 124, 150],
+            DP_GW_IP_OCTETS,
+            12345,
+            53,
+            &query,
+        );
+        {
+            use vm_memory::Bytes;
+            mem.write_slice(&encode_driver_tx(&qframe), vm_memory::GuestAddress(tx_addr))?;
+        }
+        post_desc_and_kick(&mem, fe.kick_fd(RX_VRING), RX_VRING, 6, rx0, 512, 2)?;
+        post_desc_and_kick(
+            &mem,
+            fe.kick_fd(TX_VRING),
+            TX_VRING,
+            5,
+            tx_addr,
+            (qframe.len() + VNET_HDR_LEN) as u32,
+            0,
+        )?;
+
+        let reply_len = wait_used_elem_len(&mem, 0, Duration::from_secs(5))? as usize;
+        assert!(
+            reply_len >= VNET_HDR_LEN + 14 + 20 + 8,
+            "no DNS reply reached the VM (RX completion carried {reply_len} bytes)"
+        );
+        let reply_frame = {
+            use vm_memory::Bytes;
+            let mut buf = vec![0u8; reply_len];
+            mem.read_slice(&mut buf, vm_memory::GuestAddress(rx0))?;
+            decode_driver_rx(&buf)
+                .map(|f| f.to_vec())
+                .ok_or("no vnet header on DNS reply")?
+        };
+        assert_eq!(
+            &reply_frame[0..6],
+            &DP_VM_MAC,
+            "non-DHCP reply must keep the port's pinned MAC as the Ethernet destination"
+        );
+        assert_eq!(
+            &reply_frame[30..34],
+            &[192, 168, 124, 150],
+            "DNS reply must be IP-addressed to the query's source IP"
         );
 
         drop(fe);
