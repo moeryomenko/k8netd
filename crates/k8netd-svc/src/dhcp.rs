@@ -97,13 +97,20 @@ impl DhcpServer {
     /// Answers a REQUEST: ACK iff the requested IP is bound to the
     /// requesting MAC (`Ipam::lookup(chaddr) == Some(requested)`) — either
     /// from a prior OFFER in this session or from a reservation that
-    /// survived a daemon restart. NAK otherwise (a missing
-    /// `RequestedIpAddress` option, an IP bound to a different MAC, an IP
-    /// outside the pool, or the gateway).
+    /// survived a daemon restart. NAK otherwise (an IP bound to a different
+    /// MAC, an IP outside the pool, or the gateway).
+    ///
+    /// The requested IP is the `RequestedIpAddress` option (50) when present
+    /// (SELECTING / INIT-REBOOT semantics). A client in RENEWING state omits
+    /// option 50 and puts its current address in `ciaddr` (RFC 2131 section
+    /// 4.3.5), so when option 50 is absent the request falls back to
+    /// `ciaddr` and is ACKed iff it matches the MAC's binding. A request with
+    /// neither option 50 nor a usable `ciaddr` (0.0.0.0) is NAK'd, since the
+    /// pool never contains 0.0.0.0.
     fn request(&mut self, msg: &Message, mac: MacAddr) -> Option<Vec<u8>> {
         let requested = match msg.opts().get(OptionCode::RequestedIpAddress) {
             Some(DhcpOption::RequestedIpAddress(ip)) => *ip,
-            _ => return self.nak(msg),
+            _ => msg.ciaddr(),
         };
         if self.ipam.lookup(mac) == Some(requested) {
             self.reply(msg, requested, MessageType::Ack)
@@ -309,6 +316,21 @@ mod tests {
         if let Some(ip) = requested {
             msg.opts_mut().insert(DhcpOption::RequestedIpAddress(ip));
         }
+        msg
+    }
+
+    /// A RENEWING-state REQUEST (RFC 2131 section 4.3.5): the client omits
+    /// option 50 and puts its current address in `ciaddr`.
+    fn renew(xid: u32, addr: &str, ciaddr: Ipv4Addr) -> Message {
+        let mut msg = Message::new_with_id(
+            xid,
+            ciaddr,
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::UNSPECIFIED,
+            &mac_bytes(addr),
+        );
+        msg.opts_mut().insert(DhcpOption::MessageType(MessageType::Request));
         msg
     }
 
@@ -548,6 +570,106 @@ mod tests {
     fn request_without_requested_ip_option_yields_nak() {
         let mut server = server();
         let nak = exchange(&mut server, &request(XID, MAC_A, None)).expect("a NAK is expected");
+        assert_reply(&nak, XID, MAC_A, MessageType::Nak);
+    }
+
+    // TASK-010X: RENEWING-state REQUEST (RFC 2131 section 4.3.5) — option 50
+    // absent, the client's current address in ciaddr. The server must ACK a
+    // renewal whose ciaddr matches the IPAM binding for the client MAC, and
+    // NAK anything else. Option 50, when present, stays authoritative.
+
+    #[test]
+    fn renewing_request_with_matching_ciaddr_yields_ack() {
+        // The client renews at T1: no option 50, ciaddr = its bound address.
+        let mut server = server();
+        let offer = exchange(&mut server, &discover(XID, MAC_A)).expect("an OFFER is expected");
+        let bound = offer.yiaddr(); // .10, now bound to MAC_A
+        let ack = exchange(&mut server, &renew(XID, MAC_A, bound)).expect("an ACK is expected");
+        assert_reply(&ack, XID, MAC_A, MessageType::Ack);
+        assert_eq!(ack.yiaddr(), bound, "the ACK must carry the renewed ciaddr");
+        assert_req3_options(&ack, ip(255, 255, 255, 0));
+    }
+
+    #[test]
+    fn reserved_mac_renewing_with_ciaddr_yields_ack() {
+        // The production scenario: a reserved MAC (pre-allocated via Ipam)
+        // renews at T1 with ciaddr only.
+        let mut ipam = Ipam::new(lab_network());
+        let reserved = ipam.allocate(mac(MAC_R)).expect("pool has free addresses");
+        let mut server = DhcpServer::new(ipam);
+        let ack = exchange(&mut server, &renew(XID, MAC_R, reserved)).expect("an ACK is expected");
+        assert_reply(&ack, XID, MAC_R, MessageType::Ack);
+        assert_eq!(ack.yiaddr(), reserved, "the reserved IP must be ACKed on renewal");
+    }
+
+    #[test]
+    fn renewing_request_with_ciaddr_bound_to_other_mac_yields_nak() {
+        // ciaddr is bound to a different MAC: no unauthorized renewal.
+        let mut server = server();
+        let offer_a = exchange(&mut server, &discover(XID, MAC_A)).expect("an OFFER is expected"); // .10
+        exchange(&mut server, &discover(XID, MAC_B)).expect("an OFFER is expected"); // .11
+        let nak = exchange(&mut server, &renew(XID, MAC_B, offer_a.yiaddr())).expect("a NAK is expected");
+        assert_reply(&nak, XID, MAC_B, MessageType::Nak);
+    }
+
+    #[test]
+    fn renewing_request_with_unbound_ciaddr_yields_nak() {
+        // ciaddr is a pool address no MAC is bound to: not a valid renewal.
+        let mut server = server();
+        exchange(&mut server, &discover(XID, MAC_A)).expect("an OFFER is expected"); // .10
+        let nak = exchange(&mut server, &renew(XID, MAC_A, ip(192, 168, 124, 11))).expect("a NAK is expected");
+        assert_reply(&nak, XID, MAC_A, MessageType::Nak);
+    }
+
+    #[test]
+    fn renewing_request_with_ciaddr_outside_pool_yields_nak() {
+        let mut server = server();
+        exchange(&mut server, &discover(XID, MAC_A)).expect("an OFFER is expected");
+        let nak = exchange(&mut server, &renew(XID, MAC_A, ip(192, 168, 124, 5))).expect("a NAK is expected");
+        assert_reply(&nak, XID, MAC_A, MessageType::Nak);
+    }
+
+    #[test]
+    fn renewing_request_with_ciaddr_equal_gateway_yields_nak() {
+        let mut server = server();
+        exchange(&mut server, &discover(XID, MAC_A)).expect("an OFFER is expected");
+        let nak = exchange(&mut server, &renew(XID, MAC_A, GATEWAY)).expect("a NAK is expected");
+        assert_reply(&nak, XID, MAC_A, MessageType::Nak);
+    }
+
+    #[test]
+    fn request_without_option50_and_unspecified_ciaddr_yields_nak() {
+        // Neither option 50 nor a usable ciaddr: NAK even when the MAC has a
+        // binding (0.0.0.0 is never a valid renewal target).
+        let mut server = server();
+        exchange(&mut server, &discover(XID, MAC_A)).expect("an OFFER is expected");
+        let nak = exchange(&mut server, &request(XID, MAC_A, None)).expect("a NAK is expected");
+        assert_reply(&nak, XID, MAC_A, MessageType::Nak);
+    }
+
+    #[test]
+    fn request_with_option50_takes_precedence_over_ciaddr() {
+        // A REQUEST carrying both option 50 and a ciaddr is judged by option
+        // 50 (SELECTING/INIT-REBOOT semantics), never the ciaddr.
+        let mut server = server();
+        let offer = exchange(&mut server, &discover(XID, MAC_A)).expect("an OFFER is expected"); // .10
+        let mut r = request(XID, MAC_A, Some(offer.yiaddr()));
+        r.set_ciaddr(ip(192, 168, 124, 11)); // ciaddr claims an unbound address
+        let ack = exchange(&mut server, &r).expect("an ACK is expected");
+        assert_reply(&ack, XID, MAC_A, MessageType::Ack);
+        assert_eq!(ack.yiaddr(), offer.yiaddr(), "option 50 wins over ciaddr");
+    }
+
+    #[test]
+    fn request_with_option50_mismatch_naks_even_when_ciaddr_matches() {
+        // option 50 requests an IP bound to another MAC while ciaddr matches
+        // this MAC's own binding: option 50 governs, so the request is NAK'd.
+        let mut server = server();
+        let offer_a = exchange(&mut server, &discover(XID, MAC_A)).expect("an OFFER is expected"); // .10
+        exchange(&mut server, &discover(XID, MAC_B)).expect("an OFFER is expected"); // .11
+        let mut r = request(XID, MAC_A, Some(ip(192, 168, 124, 11))); // option 50 = MAC_B's .11
+        r.set_ciaddr(offer_a.yiaddr()); // ciaddr = MAC_A's own .10
+        let nak = exchange(&mut server, &r).expect("a NAK is expected");
         assert_reply(&nak, XID, MAC_A, MessageType::Nak);
     }
 
