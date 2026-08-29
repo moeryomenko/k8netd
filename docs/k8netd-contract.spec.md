@@ -91,11 +91,17 @@ resolvers. No local zones; CoreDNS in the cluster is untouched.
 ### REQ-007: L2 switch
 MAC learning table, unknown-unicast and broadcast/multicast flooding, known-
 unicast forwarding between ports on the same network. Gateway function per
-network: answer ARP for the gateway address; forward each port's non-local IP
-packets to that port's own passt WAN port. No inbound L3 routing: per-VM passt
-handles inbound to its single guest deterministically. No special handling for
-Cilium L2 announcements: ARP floods reach all ports and the Cilium agent
-answers.
+network: answer ARP for the gateway address; forward each port's
+gateway-MAC-addressed IP packets to that port's own passt WAN port. A frame
+is WAN egress when its destination MAC is the network's gateway MAC
+(`02:00:<o1>:<o2>:<o3>:<o4>`, the VM's default router); every other
+destination — including pod-CIDR traffic the VM routes to a peer VM's MAC —
+stays on the L2 fabric regardless of its destination IP. This MAC-based
+classification is what lets Cilium's pod CIDR (a range outside the VM
+network CIDR) flow between VMs as plain L2. No inbound L3 routing: per-VM
+passt handles inbound to its single guest deterministically. No special
+handling for Cilium L2 announcements: ARP floods reach all ports and the
+Cilium agent answers.
 
 ### REQ-008: WAN (per-VM passt)
 One passt subprocess per attached port, connected via an AF_UNIX socketpair
