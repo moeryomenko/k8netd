@@ -292,8 +292,7 @@ impl NetBackend {
                 tracing::trace!(vring = RX_VRING, "rx service: iter failed");
                 return Ok(());
             };
-            loop {
-                let Some(chain) = iter.next() else { break };
+            while let Some(chain) = iter.next() {
                 let head = chain.head_index();
                 if head_flags(snapshot, desc_table, head) & VIRTQ_DESC_F_WRITE == 0 {
                     // Not an ingress slot; complete it empty.
@@ -568,10 +567,10 @@ impl VhostPort {
                 // Register the RX delivery notifier on the RX worker's
                 // epoll (thread 0): kick_rx events resume buffer filling
                 // without any driver-side kick.
-                if let Some(handler) = daemon.get_epoll_handlers().first() {
-                    if let Err(e) = handler.register_listener(session_notify.as_raw_fd(), EventSet::IN, RX_NOTIFY_ID) {
-                        tracing::warn!(%e, "rx notifier registration failed");
-                    }
+                if let Some(handler) = daemon.get_epoll_handlers().first()
+                    && let Err(e) = handler.register_listener(session_notify.as_raw_fd(), EventSet::IN, RX_NOTIFY_ID)
+                {
+                    tracing::warn!(%e, "rx notifier registration failed");
                 }
                 let _ = daemon.wait();
                 // Tear the session down explicitly: Drop's blind conn.shutdown
