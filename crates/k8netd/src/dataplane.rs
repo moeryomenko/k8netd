@@ -428,6 +428,17 @@ impl ControlPlane for Dataplane {
         port.mac = Some(mac);
         g.switch.add_port(PortId(id), &net_name);
         g.gateway.add_port(PortId(id), &net_name);
+
+        // REQ-008: every attached VM gets a WAN passt — even with no
+        // published forwards — so out-of-CIDR IPv4 egress works for VMs that
+        // never call PublishPort (e.g. worker nodes). The VM IP is the
+        // attach-time IPAM reservation for this MAC; an empty forward set
+        // renders `passt -a <vm-ip>` with no `-t` flags, which still provides
+        // outbound NAT. PublishPort later upgrades this same slot with its
+        // forwards (ensure_passt restarts passt when the forward set changes).
+        let vm_ip = g.networks[&net_name].ipam.lookup(mac).ok_or(RpcError::NotFound)?;
+        ensure_passt(&mut g, &port_name, &vm_ip.to_string(), BTreeMap::new())?;
+
         Ok(Value::Null)
     }
 
