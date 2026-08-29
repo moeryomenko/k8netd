@@ -740,13 +740,12 @@ fn read_passt_frames(
                     // replies (notably ARP) back to passt (REQ-008).
                     if payload.len() >= 6 {
                         let mac: [u8; 6] = payload[6..12].try_into().expect("6-byte slice");
-                        if let Ok(mut g) = inner.lock() {
-                            if let Some(slot) = g.passts.get_mut(name) {
-                                if slot.mac != Some(mac) {
-                                    slot.mac = Some(mac);
-                                    tracing::trace!(port = name, mac = %hex_prefix(&mac), "passt mac learned");
-                                }
-                            }
+                        if let Ok(mut g) = inner.lock()
+                            && let Some(slot) = g.passts.get_mut(name)
+                            && slot.mac != Some(mac)
+                        {
+                            slot.mac = Some(mac);
+                            tracing::trace!(port = name, mac = %hex_prefix(&mac), "passt mac learned");
                         }
                     }
                     if inject.send(PortMessage::ToVm(payload)).is_err() {
@@ -984,6 +983,7 @@ fn gateway_icmp_reply(g: &Inner, port: &str, frame: &[u8]) -> Option<Vec<u8>> {
 /// Computes the ones-complement Internet checksum over `data`.
 fn inet_checksum(data: &[u8]) -> u16 {
     let mut sum = 0u32;
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     let mut words = data.chunks_exact(2);
     for w in &mut words {
         sum += u32::from(u16::from_be_bytes([w[0], w[1]]));
