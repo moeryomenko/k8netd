@@ -30,7 +30,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use k8netd_core::ipam::{Ipam, IpamError};
-use k8netd_core::model::{IpPool, Ipv4Cidr, MacAddr, PublishTable};
+use k8netd_core::model::{IpPool, MacAddr, PublishTable};
 use k8netd_core::switch::engine::Switch;
 use k8netd_core::switch::gateway::{Gateway, GatewayAction};
 use k8netd_core::switch::mac_table::PortId;
@@ -558,16 +558,16 @@ fn pump_frame(name: &str, me: PortId, frame: &[u8], inner: &Arc<Mutex<Inner>>) {
         inject_to(&g, name, reply);
         return;
     }
-    // IPv4 egress (REQ-007): a destination outside the ingress network's
-    // CIDR goes to this port's own passt; local traffic falls through to
-    // the switch fabric unchanged. Classified here (not via the core
-    // gateway) so the destination IP is read with the same tolerant header
-    // handling the service seam uses.
+    // IPv4 egress (REQ-007): a frame addressed to the ingress network's
+    // gateway MAC (the VM's default router) goes to this port's own passt;
+    // every other destination — including pod-CIDR traffic the VM routes to
+    // a peer VM's MAC — stays on the switch fabric unchanged. Classified via
+    // the gateway core so the destination MAC is read with the same tolerant
+    // header handling the ARP seam uses.
     if ethertype(frame) == Some(ETHERTYPE_IPV4)
-        && let Some((cidr, dst_ip)) = egress_probe(&g, name, frame)
-        && !cidr_contains(cidr, dst_ip)
+        && let GatewayAction::Wan(wan) = g.gateway.handle_frame(me, frame)
     {
-        passt_egress(&mut g, name, frame);
+        passt_egress(&mut g, name, wan);
         return;
     }
     // WAN uplink replies (REQ-008): a frame the VM sends back to the passt
@@ -599,16 +599,6 @@ fn pump_frame(name: &str, me: PortId, frame: &[u8], inner: &Arc<Mutex<Inner>>) {
 /// First 16 bytes of `frame` as lowercase hex (trace diagnostics).
 fn hex_prefix(frame: &[u8]) -> String {
     frame.iter().take(48).map(|b| format!("{b:02x}")).collect()
-}
-
-/// Returns the ingress network's CIDR and the frame's destination IP for an
-/// IPv4 frame, or None when the port is unattached / network unknown / the
-/// IP header unusable (in which case the L2 fabric applies).
-fn egress_probe<'a>(g: &'a Inner, port: &str, frame: &[u8]) -> Option<(&'a Ipv4Cidr, Ipv4Addr)> {
-    let lp = g.ports.get(port)?;
-    let entry = g.networks.get(lp.network.as_deref()?)?;
-    let ip = parse_ipv4(frame)?;
-    Some((&entry.ipam.network().cidr, ip.dst))
 }
 
 /// Answers the daemon-hosted services for one ingress frame: DHCP on UDP
@@ -924,16 +914,6 @@ fn parse_ipv4(frame: &[u8]) -> Option<Ipv4Frame<'_>> {
         proto: frame[end - 11],
         payload: &frame[end..],
     })
-}
-
-/// Returns true when `ip` is inside `cidr`.
-fn cidr_contains(cidr: &Ipv4Cidr, ip: Ipv4Addr) -> bool {
-    let mask = if cidr.prefix == 0 {
-        0
-    } else {
-        u32::MAX << (32 - cidr.prefix)
-    };
-    u32::from(ip) & mask == u32::from(cidr.addr)
 }
 
 /// Builds the ICMP echo reply for a request addressed to `port`'s network
@@ -1476,6 +1456,7 @@ cat <&$FD > "$ROOT/egress.bin"
 
     const DP_GW_MAC: [u8; 6] = [0x02, 0x00, 0xc0, 0xa8, 0x7c, 0x01]; // derived per REQ-007
     const DP_VM_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x09];
+    const DP_PEER_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x0a];
     const DP_GW_IP_OCTETS: [u8; 4] = [192, 168, 124, 1];
 
     fn eth_frame(dst: &[u8; 6], src: &[u8; 6], ethertype: u16, payload: &[u8]) -> Vec<u8> {
@@ -1889,9 +1870,9 @@ cat <&$FD > "$ROOT/egress.bin"
 
     // -- requirement 3: gateway seam (pump level) ----------------------------
 
-    /// R3 egress: a WAN-bound frame sent toward the gateway MAC/IP is handed
-    /// byte-identical to THIS port's passt fd; a local (in-CIDR) frame never
-    /// reaches passt.
+    /// R3 egress: a WAN-bound frame sent toward the gateway MAC is handed
+    /// byte-identical to THIS port's passt fd; a frame addressed to a peer
+    /// VM's MAC (L2 traffic, arbitrary dst IP included) never reaches passt.
     #[test]
     fn gateway_destined_frame_reaches_owning_port_passt_fd_only() -> TestResult {
         // Poisoning-tolerant: a sibling test's red-phase panic must not
@@ -1910,12 +1891,13 @@ cat <&$FD > "$ROOT/egress.bin"
         let mem = fe.mem().clone();
         let src_ip = ipv4_octets(&ip);
 
-        // Local frame: in-CIDR destination, must bypass passt entirely.
+        // Local frame: addressed to a peer VM's MAC (in-CIDR destination), must
+        // bypass passt entirely.
         let mut local_ip = ipv4_header(src_ip, [192, 168, 124, 50], 24, 17);
         local_ip.extend_from_slice(&[0x11, 0x22, 0x33, 0x44]);
-        let local = eth_frame(&DP_GW_MAC, &DP_VM_MAC, 0x0800, &local_ip);
+        let local = eth_frame(&DP_PEER_MAC, &DP_VM_MAC, 0x0800, &local_ip);
 
-        // WAN frame: out-of-CIDR destination via the gateway MAC.
+        // WAN frame: addressed to the gateway MAC (default router), outbound.
         let mut wan_ip = ipv4_header(src_ip, [8, 8, 8, 8], 24, 17);
         wan_ip.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
         let wan = eth_frame(&DP_GW_MAC, &DP_VM_MAC, 0x0800, &wan_ip);
