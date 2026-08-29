@@ -1698,6 +1698,45 @@ cat <&$FD > "$ROOT/egress.bin"
         Ok(())
     }
 
+    /// REQ-008 (A1): attach_port must spawn an egress passt even for a port
+    /// with NO published forwards, so VMs that never call PublishPort (worker
+    /// nodes) still get out-of-CIDR egress. The argv carries `-a <vm-ip>` and
+    /// no `-t` flags.
+    #[test]
+    fn attach_port_spawns_egress_passt_without_forwards() -> TestResult {
+        let _path_lock = PASST_PATH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let root = passt_temp_root("attach-egress");
+        std::fs::create_dir_all(&root)?;
+        let _guard = install_passt_stub(&root, "plain")?;
+
+        let mut dp = Dataplane::new(&root);
+        dp.create_network(&net_params())
+            .map_err(|e| format!("create_network: {e:?}"))?;
+        dp.create_port(&serde_json::json!({ "name": "vm1" }))
+            .map_err(|e| format!("create_port: {e:?}"))?;
+        dp.attach_port(&serde_json::json!({"port": "vm1", "network": "net0", "mac": "02:00:00:00:00:01"}))
+            .map_err(|e| format!("attach_port: {e:?}"))?;
+
+        assert!(
+            wait_invocations(&root, 1),
+            "attach_port must ensure a passt process (none spawned)"
+        );
+        let last = argv_lines(&root).last().expect("argv recorded").clone();
+        let tokens: Vec<&str> = last.split_whitespace().collect();
+        assert!(
+            tokens.iter().any(|t| *t == "-a"),
+            "passt argv must advertise the VM IP via -a; got [{last}]"
+        );
+        assert!(
+            !tokens.iter().any(|t| t.starts_with("-t")),
+            "attach-only passt must carry no -t forwards; got [{last}]"
+        );
+
+        let _ = dp.delete_port(&serde_json::json!({"name": "vm1"}));
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+
     /// R1: publishing a second vm_port on the same port RESTARTS passt and
     /// the new argv carries both -t forwards; the previous process is gone.
     #[test]
