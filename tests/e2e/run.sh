@@ -168,8 +168,18 @@ SSH_PORT=$(printf '%s' "$SSH_FWD" | python3 -c 'import json,sys; print(json.load
 [[ -n "$SSH_PORT" ]] || die "PublishPort returned no host_port for ssh"
 log "ssh forward: 127.0.0.1:$SSH_PORT -> vm-a:22"
 
+log "publishing VM-B ssh forward"
+SSH_FWD_B=$(rpc PublishPort '{"port":"vm-b","vm_port":22}')
+SSH_PORT_B=$(printf '%s' "$SSH_FWD_B" | python3 -c 'import json,sys; print(json.load(sys.stdin)["host_port"])')
+[[ -n "$SSH_PORT_B" ]] || die "PublishPort returned no host_port for vm-b ssh"
+log "ssh forward: 127.0.0.1:$SSH_PORT_B -> vm-b:22"
+
 vm_ssh() { # vm_ssh <command...>
 	ssh "${SSH_OPTS[@]}" -p "$SSH_PORT" root@127.0.0.1 "$@"
+}
+
+vm_ssh_b() { # vm_ssh_b <command...> — VM-B via its published ssh forward
+	ssh "${SSH_OPTS[@]}" -p "$SSH_PORT_B" root@127.0.0.1 "$@"
 }
 
 wait_vm_ssh() { # wait_vm_ssh — ssh via the published forward
@@ -197,6 +207,17 @@ vm_ssh "ping -c2 192.168.124.101" || die "east-west ping failed"
 
 log "gate: VM-A -> gateway ping"
 vm_ssh "ping -c2 192.168.124.1" || die "gateway ping failed"
+
+log "gate: VM-A -> pod-CIDR frame via VM-B stays on the L2 fabric (REQ-007)"
+# Regression (MAC-based egress): a frame with a destination IP outside the
+# network CIDR (pod-CIDR 10.244.x) that VM-A routes to peer VM-B's MAC must
+# be L2-forwarded to VM-B, never sent to VM-A's passt (WAN). VM-B hosts
+# 10.244.0.1 on a dummy interface so the ping completes only when the frame
+# is L2-forwarded; under the old dst-IP classifier k8netd would send it to
+# the WAN and the ping would time out.
+vm_ssh_b "ip link add dummy0 type dummy 2>/dev/null; ip addr add 10.244.0.1/32 dev dummy0 2>/dev/null; ip link set dummy0 up"
+vm_ssh "ip route add 10.244.0.1/32 via 192.168.124.101 2>/dev/null; ping -c2 10.244.0.1" || die "pod-CIDR L2 forwarding failed"
+vm_ssh_b "ip link del dummy0" || true
 
 log "publishing VM-A 6443 forward"
 PUBLISH_OUT=$(rpc PublishPort '{"port":"vm-a","vm_port":6443}')
