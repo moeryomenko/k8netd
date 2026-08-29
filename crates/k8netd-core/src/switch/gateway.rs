@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 
-use crate::model::{Ipv4Cidr, Network};
+use crate::model::Network;
 use crate::switch::frame::ParsedFrame;
 use crate::switch::mac_table::PortId;
 
@@ -134,24 +134,24 @@ fn arp_response<'p>(network: &Network, parsed: &ParsedFrame<'p>) -> GatewayActio
     GatewayAction::ArpReply(build_arp_reply(payload, network.gateway))
 }
 
-/// Classifies an IPv4 frame as local or non-local for `network`.
+/// Classifies an IPv4 frame as local or WAN egress for `network`.
 ///
-/// A destination IP outside the network's CIDR is egressed byte-identical to
-/// the ingress port's own passt WAN output ([`Wan`]); a destination inside
-/// the CIDR — including the gateway IP itself — is [`L2`], so VM-to-VM and
-/// VM-to-gateway traffic bypasses the WAN. An invalid IPv4 header (payload
-/// shorter than IHL*4, IHL < 5, or IP version != 4) is dropped for egress:
-/// [`L2`].
+/// A frame addressed to the network's gateway MAC (the VM's default router:
+/// `02:00:<o1>:<o2>:<o3>:<o4>`) is egressed byte-identical to the ingress
+/// port's own passt WAN output ([`Wan`]). Every other destination MAC —
+/// including pod-CIDR traffic the VM routes to a peer VM's MAC — is [`L2`],
+/// so VM-to-VM traffic (arbitrary destination IPs included) stays on the L2
+/// fabric and bypasses the WAN. An invalid IPv4 header (payload shorter than
+/// IHL*4, IHL < 5, or IP version != 4) is dropped for egress: [`L2`].
 fn ipv4_egress<'p>(network: &Network, parsed: &ParsedFrame<'p>, frame: &'p [u8]) -> GatewayAction<'p> {
     let payload = parsed.payload;
     if !is_valid_ipv4_header(payload) {
         return GatewayAction::L2;
     }
-    let dst = Ipv4Addr::from([payload[16], payload[17], payload[18], payload[19]]);
-    if in_cidr(dst, &network.cidr) {
-        GatewayAction::L2
-    } else {
+    if frame.len() >= 6 && frame[..6] == gateway_mac(network.gateway) {
         GatewayAction::Wan(frame)
+    } else {
+        GatewayAction::L2
     }
 }
 
@@ -193,16 +193,6 @@ fn is_valid_ipv4_header(payload: &[u8]) -> bool {
     let version = first >> 4;
     let ihl = (first & 0x0f) as usize;
     version == 4 && ihl >= IPV4_MIN_IHL && payload.len() >= ihl * IPV4_IHL_UNIT
-}
-
-/// Returns true when `ip` is inside `cidr`.
-fn in_cidr(ip: Ipv4Addr, cidr: &Ipv4Cidr) -> bool {
-    let mask = if cidr.prefix == 0 {
-        0
-    } else {
-        u32::MAX << (32 - cidr.prefix)
-    };
-    u32::from(ip) & mask == u32::from(cidr.addr)
 }
 
 /// Derives the gateway MAC from the gateway IP: 02:00:<o1>:<o2>:<o3>:<o4>
@@ -510,9 +500,15 @@ mod tests {
     #[test]
     fn non_local_ipv4_on_second_network_routed_to_wan() {
         let gw = two_network_gateway();
-        // D (10.0.0.10) on staging sends to 9.9.9.9, outside 10.0.0.0/24:
-        // classification uses the ingress network's CIDR, not a fixed one.
-        let frame = ipv4_frame(&BCAST, &MAC_D, ip(10, 0, 0, 10), ip(9, 9, 9, 9));
+        // D (10.0.0.10) on staging sends to 9.9.9.9 through the staging
+        // gateway (10.0.0.1 -> 02:00:0a:00:00:01): a frame addressed to the
+        // gateway MAC is WAN egress on any network, not just the lab one.
+        let frame = ipv4_frame(
+            &[0x02, 0x00, 0x0a, 0x00, 0x00, 0x01],
+            &MAC_D,
+            ip(10, 0, 0, 10),
+            ip(9, 9, 9, 9),
+        );
         match gw.handle_frame(PortId(9), &frame) {
             GatewayAction::Wan(wan) => assert_eq!(wan, &frame),
             other => panic!("expected Wan, got {other:?}"),
@@ -532,13 +528,28 @@ mod tests {
     }
 
     #[test]
-    fn local_ipv4_to_gateway_ip_bypasses_wan() {
+    fn pod_cidr_ipv4_to_peer_vm_mac_stays_on_fabric() {
         let gw = lab_gateway();
-        // A sends to the gateway IP itself (192.168.124.1): inside the
-        // CIDR, so L2 only — serving the gateway (DNS/DHCP) is the
-        // services' job (spec REQ-005/006), not the egress classifier's.
-        let frame = ipv4_frame(&GW_MAC_LAB, &MAC_A, ip(192, 168, 124, 10), ip(192, 168, 124, 1));
+        // A routes pod-CIDR traffic (10.244.x, outside 192.168.124.0/24) to
+        // peer VM B's MAC: the destination MAC is a peer, not the gateway,
+        // so it MUST stay on the L2 fabric (the node L3-routes it to B) —
+        // never the WAN. This is the regression the MAC-based classifier
+        // fixes: a dst IP outside the network CIDR must not imply WAN when
+        // the frame is addressed to a peer VM.
+        let frame = ipv4_frame(&MAC_B, &MAC_A, ip(192, 168, 124, 10), ip(10, 244, 0, 183));
         assert!(matches!(gw.handle_frame(PortId(1), &frame), GatewayAction::L2));
+    }
+
+    #[test]
+    fn ipv4_to_gateway_mac_is_wan_egress() {
+        let gw = lab_gateway();
+        // A addresses the gateway MAC (its default router): the frame is
+        // WAN egress. The gateway services (DNS/DHCP on the gateway IP) are
+        // answered by the service seam before this classifier in the
+        // dataplane, so a frame that reaches the classifier addressed to
+        // the gateway MAC is outbound.
+        let frame = ipv4_frame(&GW_MAC_LAB, &MAC_A, ip(192, 168, 124, 10), ip(8, 8, 8, 8));
+        assert!(matches!(gw.handle_frame(PortId(1), &frame), GatewayAction::Wan(_)));
     }
 
     #[test]
