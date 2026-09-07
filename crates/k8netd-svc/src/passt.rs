@@ -9,7 +9,7 @@
 //! # argv contract (pinned by the integration spec)
 //!
 //! ```text
-//! passt -F <fd> -a <vm-ip> -t <host-port>:<vm-port> ... --foreground
+//! passt -F <fd> -a <vm-ip> -n <netmask> -g <gateway> -t <host-port>:<vm-port> ... --foreground
 //! ```
 //!
 //! The `-t` spec is bare `hostport:guestport` — no guest address. Verified
@@ -18,6 +18,15 @@
 //! and host 2026_07_28 accept `-t20010:6443` with rc=0, while an embedded
 //! guest address (`-t<host>:0.0.0.0/<vm>`) is rejected with "Invalid port
 //! specifier". The guest address comes solely from `-a`.
+//!
+//! `-n`/`-g` pin the guest's subnet and router explicitly. Without them
+//! passt derives its network view from the host's first default-route
+//! interface; on a host where another pasta/passt tap holds a default route
+//! (e.g. a rootless podman container's `happ-*` tap), the VM IP falls
+//! outside the derived subnet, `-t` forwards resolve through the *kernel*
+//! route toward that unrelated tap, and every published-port connection
+//! silently disappears. Passing the network's own netmask and gateway makes
+//! the VM on-link inside passt regardless of host FIB pollution.
 //!
 //! Unit tests stub the `passt` binary on PATH (a shell script that records
 //! argv and exits on cue); no real passt is required.
@@ -49,6 +58,12 @@ pub struct PortForward {
 pub struct PasstConfig {
     /// VM address advertised with `-a`.
     pub vm_ip: String,
+    /// Network mask advertised with `-n` (makes the VM IP on-link inside
+    /// passt regardless of the host's routing table pollution).
+    pub netmask: String,
+    /// Gateway address advertised with `-g` (the network's router, matching
+    /// the ARP responder the daemon runs on that network).
+    pub gateway: String,
     /// Port forwards rendered as `-t` flags, in order.
     pub forwards: Vec<PortForward>,
 }
@@ -63,6 +78,10 @@ pub fn passt_argv(config: &PasstConfig, fd: RawFd) -> Vec<String> {
         fd.to_string(),
         "-a".to_string(),
         config.vm_ip.clone(),
+        "-n".to_string(),
+        config.netmask.clone(),
+        "-g".to_string(),
+        config.gateway.clone(),
     ];
     for f in &config.forwards {
         // Bare `hostport:guestport`: verified empirically on BOTH passt
@@ -91,10 +110,16 @@ pub fn passt_argv(config: &PasstConfig, fd: RawFd) -> Vec<String> {
 /// table; an empty map yields no `-t` flags at all. Egress behavior is
 /// unaffected.
 ///
+/// `netmask` and `gateway` come from the owning network's model and render
+/// as `-n`/`-g`, pinning the VM's subnet view inside passt (see the module
+/// argv contract).
+///
 /// Each entry renders as one `-t<host>:<vm>` flag.
-pub fn passt_config_for(vm_ip: &str, published: &BTreeMap<u16, u16>) -> PasstConfig {
+pub fn passt_config_for(vm_ip: &str, netmask: &str, gateway: &str, published: &BTreeMap<u16, u16>) -> PasstConfig {
     PasstConfig {
         vm_ip: vm_ip.to_string(),
+        netmask: netmask.to_string(),
+        gateway: gateway.to_string(),
         forwards: published.iter().map(|(&vm, &host)| PortForward { host, vm }).collect(),
     }
 }
@@ -255,6 +280,8 @@ mod tests {
     fn cfg(forwards: &[(u16, u16)]) -> PasstConfig {
         PasstConfig {
             vm_ip: "192.168.124.20".to_string(),
+            netmask: "255.255.255.0".to_string(),
+            gateway: "192.168.124.1".to_string(),
             forwards: forwards.iter().map(|&(h, v)| PortForward { host: h, vm: v }).collect(),
         }
     }
@@ -271,6 +298,10 @@ mod tests {
                 "7",
                 "-a",
                 "192.168.124.20",
+                "-n",
+                "255.255.255.0",
+                "-g",
+                "192.168.124.1",
                 "-t6443:6443",
                 "--foreground"
             ]
@@ -282,10 +313,23 @@ mod tests {
     #[test]
     fn argv_multiple_forwards_in_order() -> TestResult {
         let argv = passt_argv(&cfg(&[(6443, 6443), (22, 2222)]), 9);
-        assert_eq!(&argv[..5], &["passt", "--fd", "9", "-a", "192.168.124.20"]);
-        assert_eq!(argv[5], "-t6443:6443");
-        assert_eq!(argv[6], "-t22:2222");
-        assert_eq!(argv.len(), 8);
+        assert_eq!(
+            &argv[..9],
+            &[
+                "passt",
+                "--fd",
+                "9",
+                "-a",
+                "192.168.124.20",
+                "-n",
+                "255.255.255.0",
+                "-g",
+                "192.168.124.1"
+            ]
+        );
+        assert_eq!(argv[9], "-t6443:6443");
+        assert_eq!(argv[10], "-t22:2222");
+        assert_eq!(argv.len(), 12);
         Ok(())
     }
 
@@ -293,7 +337,7 @@ mod tests {
     #[test]
     fn argv_without_forwards_has_no_t_flags() -> TestResult {
         let argv = passt_argv(&cfg(&[]), 3);
-        assert_eq!(argv.len(), 6);
+        assert_eq!(argv.len(), 10);
         assert!(argv.iter().all(|a| !a.starts_with("-t")));
         Ok(())
     }
@@ -458,7 +502,7 @@ mod tests {
     #[test]
     fn published_entries_render_exact_t_args() -> TestResult {
         let published = BTreeMap::from([(6443u16, 6443u16), (22u16, 22u16)]);
-        let config = passt_config_for("192.168.124.20", &published);
+        let config = passt_config_for("192.168.124.20", "255.255.255.0", "192.168.124.1", &published);
         let argv = passt_argv(&config, 7);
 
         let t_args: Vec<&String> = argv.iter().filter(|a| a.starts_with("-t")).collect();
@@ -470,7 +514,20 @@ mod tests {
             );
         }
         // Egress unchanged: everything before the forwards is the pinned base.
-        assert_eq!(&argv[..5], &["passt", "--fd", "7", "-a", "192.168.124.20"]);
+        assert_eq!(
+            &argv[..9],
+            &[
+                "passt",
+                "--fd",
+                "7",
+                "-a",
+                "192.168.124.20",
+                "-n",
+                "255.255.255.0",
+                "-g",
+                "192.168.124.1"
+            ]
+        );
         Ok(())
     }
 
@@ -478,9 +535,9 @@ mod tests {
     /// unchanged (REQ-010).
     #[test]
     fn unpublished_port_renders_no_t_args_egress_unchanged() -> TestResult {
-        let config = passt_config_for("192.168.124.20", &BTreeMap::new());
+        let config = passt_config_for("192.168.124.20", "255.255.255.0", "192.168.124.1", &BTreeMap::new());
         let argv = passt_argv(&config, 7);
-        assert_eq!(argv.len(), 6, "no published entries: egress prefix plus --foreground");
+        assert_eq!(argv.len(), 10, "no published entries: egress prefix plus --foreground");
         assert!(argv.iter().all(|a| !a.starts_with("-t")));
         Ok(())
     }

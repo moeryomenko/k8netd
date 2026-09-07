@@ -759,7 +759,21 @@ fn read_passt_frames(
 /// live, otherwise terminates the old process and spawns a new one with
 /// the pinned argv (`--fd <n> -a <vm_ip>` plus one `-t` per forward).
 fn ensure_passt(g: &mut Inner, port: &str, vm_ip: &str, published: BTreeMap<u16, u16>) -> Result<(), RpcError> {
-    let config = passt::passt_config_for(vm_ip, &published);
+    // Pin the passt subnet view to the owning network: the netmask from the
+    // CIDR and the gateway the daemon's ARP responder already answers for.
+    // Without these, passt derives its view from the host's default-route
+    // interface and a foreign pasta tap can pull the VM IP off-link,
+    // silently blackholing every published-port connection.
+    let net_name = g
+        .ports
+        .get(port)
+        .and_then(|p| p.network.clone())
+        .ok_or(RpcError::NotFound)?;
+    let net = g.networks.get(&net_name).ok_or(RpcError::NotFound)?;
+    let model = net.ipam.network();
+    let netmask = model.cidr.netmask().to_string();
+    let gateway = model.gateway.to_string();
+    let config = passt::passt_config_for(vm_ip, &netmask, &gateway, &published);
     let slot = g.passts.entry(port.to_string()).or_insert(PasstSlot {
         desired: config.clone(),
         live: None,

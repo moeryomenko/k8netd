@@ -50,6 +50,8 @@ fn real_passt_spawn_argv_and_terminate() {
 
     let config = k8netd_svc::passt::PasstConfig {
         vm_ip: "192.168.124.20".to_string(),
+        netmask: "255.255.255.0".to_string(),
+        gateway: "192.168.124.1".to_string(),
         forwards: vec![k8netd_svc::passt::PortForward { host: 6443, vm: 6443 }],
     };
 

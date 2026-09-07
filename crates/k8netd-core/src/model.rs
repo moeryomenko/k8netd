@@ -63,6 +63,14 @@ impl Ipv4Cidr {
             u32::MAX << (32 - self.prefix)
         }
     }
+
+    /// Returns the dotted-quad netmask for the prefix (e.g. /24 ->
+    /// 255.255.255.0). Callers that must hand the mask to external tools
+    /// (passt's `-n`) use this instead of re-deriving `mask()`.
+    #[must_use]
+    pub fn netmask(&self) -> Ipv4Addr {
+        Ipv4Addr::from(self.mask())
+    }
 }
 
 impl FromStr for Ipv4Cidr {
