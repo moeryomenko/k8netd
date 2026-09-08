@@ -1,4 +1,23 @@
-# Build and push the k8netd runtime image to ghcr.io.
+# Build and push the k8netd runtime image to ghcr.io/moeryomenko.
+#
+# Tag semantics (ported from capishim's push-images.yml):
+#   - push of a v* tag (via `git release-tag` / `git release-minor-tag` /
+#     `git release-patch-tag`): publishes the image as :<tag> and, only when
+#     <tag> is the highest v* tag in the repo, also moves :latest. Publishing
+#     is gated on the check jobs for tag events.
+#   - push to main (or workflow_dispatch): publishes the image as :edge,
+#     unconditionally (the check jobs are skipped; ci.yml already covers
+#     branch pushes). :latest is never moved by a branch build.
+#   - k8netd's e2e suite (tests/e2e/run.sh) is lab-host only (KVM +
+#     cloud-hypervisor + base image), so unlike capishim there is no advisory
+#     e2e job here.
+#
+# Two layers: fmt/clippy/build/test (tag events only, the release gate) and
+# publish (builds via `make image` with VERSION/REVISION set to the computed
+# full ref name (v0.1.2 / edge) and the commit, then pushes to ghcr.io;
+# build.rs strips the leading v for k8netd --version only). Rootless podman on
+# ubuntu-latest keeps image content identical to what the local `make image`
+# produces.
 
 name: push-images
 
@@ -8,29 +27,115 @@ on:
     tags: ['v*']
   workflow_dispatch:
 
+concurrency:
+  group: push-images-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   GHCR_OWNER: moeryomenko
   IMAGE_BASE: k8netd
 
 jobs:
-  push:
+  fmt-check:
+    name: formatting
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+
+  clippy:
+    name: clippy
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy -- -D warnings
+
+  build:
+    name: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace
+
+  test:
+    name: test
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+
+  publish:
     name: build + push to ghcr.io
+    # On tags all four gate jobs must pass; on main/dispatch the edge build
+    # publishes unconditionally (the gate jobs are skipped, so needs results
+    # must not block — hence always()).
+    needs: [fmt-check, clippy, build, test]
+    if: >-
+      always() && (
+        (github.ref_type == 'tag'
+          && !contains(needs.*.result, 'failure')
+          && !contains(needs.*.result, 'cancelled')) ||
+        (github.ref_type == 'branch') ||
+        (github.event_name == 'workflow_dispatch')
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
       contents: read
       packages: write
     steps:
+      # Full history so the :latest guard can list every v* tag.
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
+      # Release tags publish <tag> (+ latest when <tag> is the highest v*
+      # tag, so backport tags never downgrade latest); everything else is the
+      # rolling edge build of main. VERSION is the full ref name (v0.1.2 /
+      # edge); build.rs strips the leading v for k8netd --version, while the
+      # image tag and OCI labels keep the full ref.
       - name: Compute image tag
         id: tag
         run: |
-          if [[ "${{ github.ref_type }}" == "tag" ]]; then
-            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+            echo "version=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+            highest="$(git tag -l 'v*' --sort=-v:refname | head -1)"
+            if [[ "$GITHUB_REF_NAME" == "$highest" ]]; then
+              echo "push_latest=true" >> "$GITHUB_OUTPUT"
+            fi
           else
-            echo "tag=latest" >> "$GITHUB_OUTPUT"
+            echo "tag=edge" >> "$GITHUB_OUTPUT"
+            echo "version=edge" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Log in to ghcr.io
@@ -40,11 +145,31 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # The Makefile is the single build path: it passes VERSION/REVISION as
+      # build args, which land in the binary (k8netd --version) and the OCI
+      # labels alike.
       - name: Build k8netd image
-        run: podman build -t "localhost/${IMAGE_BASE}:dev" -f Containerfile .
+        env:
+          IMAGE_TAG: ${{ steps.tag.outputs.tag }}
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          make image \
+            IMAGE="localhost/${IMAGE_BASE}:${IMAGE_TAG}" \
+            VERSION="$VERSION" \
+            REVISION="$GITHUB_SHA"
 
       - name: Push image to ghcr.io
+        env:
+          IMAGE_TAG: ${{ steps.tag.outputs.tag }}
+          PUSH_LATEST: ${{ steps.tag.outputs.push_latest }}
         run: |
-          podman tag "localhost/${IMAGE_BASE}:dev" \
-            "ghcr.io/${GHCR_OWNER}/${IMAGE_BASE}:${{ steps.tag.outputs.tag }}"
-          podman push "ghcr.io/${GHCR_OWNER}/${IMAGE_BASE}:${{ steps.tag.outputs.tag }}"
+          set -euo pipefail
+          podman tag "localhost/${IMAGE_BASE}:${IMAGE_TAG}" \
+            "ghcr.io/${GHCR_OWNER}/${IMAGE_BASE}:${IMAGE_TAG}"
+          podman push "ghcr.io/${GHCR_OWNER}/${IMAGE_BASE}:${IMAGE_TAG}"
+          if [[ "$PUSH_LATEST" == "true" ]]; then
+            podman tag "ghcr.io/${GHCR_OWNER}/${IMAGE_BASE}:${IMAGE_TAG}" \
+              "ghcr.io/${GHCR_OWNER}/${IMAGE_BASE}:latest"
+            podman push "ghcr.io/${GHCR_OWNER}/${IMAGE_BASE}:latest"
+          fi

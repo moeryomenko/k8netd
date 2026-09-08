@@ -158,6 +158,13 @@ fn parse_publish_range(raw: &str) -> Result<(u16, u16), ConfigError> {
     Ok((start, end))
 }
 
+/// Returns true when any argument requests the version banner. Checked in
+/// `main()` BEFORE [`parse_flags`] — the flag is deliberately not part of
+/// [`Flags`] so version reporting stays orthogonal to configuration.
+pub fn wants_version<'a>(args: impl IntoIterator<Item = &'a str>) -> bool {
+    args.into_iter().any(|a| a == "--version" || a == "-V")
+}
+
 /// Parses CLI arguments into [`Flags`] (flag-over-env precedence).
 ///
 /// Recognized: `--socket-dir <p>`, `--passt-binary <b>`, `--upstream-dns <l>`,
@@ -288,6 +295,23 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    /// The version banner is a pre-parse short-circuit: the predicate accepts
+    /// it anywhere in argv, while parse_flags still rejects it as unknown
+    /// (main() never lets it through).
+    #[test]
+    fn version_flag_short_circuits_before_parse() {
+        assert!(wants_version(["--version"]));
+        assert!(wants_version(["-V"]));
+        assert!(wants_version(["--socket-dir", "/x", "--version"]));
+        assert!(!wants_version(["--socket-dir", "/x"]));
+        let empty: [&str; 0] = [];
+        assert!(!wants_version(empty));
+        assert!(
+            parse_flags(["--version".to_string()].into_iter()).is_err(),
+            "--version must not become a configuration flag"
+        );
     }
 
     /// Flag parsing covers all flags and rejects unknown ones.

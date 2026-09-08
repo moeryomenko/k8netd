@@ -8,8 +8,18 @@
 mod config;
 mod dataplane;
 
+/// Artifact self-identification (baked by build.rs from the image build
+/// args: release tag / "edge" / "dev", plus the source commit).
+const VERSION: &str = env!("K8NETD_VERSION");
+const REVISION: &str = env!("K8NETD_REVISION");
+
 fn main() {
-    let flags = match config::parse_flags(std::env::args().skip(1)) {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if config::wants_version(argv.iter().map(String::as_str)) {
+        println!("k8netd {VERSION} ({REVISION})");
+        return;
+    }
+    let flags = match config::parse_flags(argv.into_iter()) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("k8netd: {e}");
@@ -29,7 +39,7 @@ fn main() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
-    tracing::info!(?cfg, "k8netd starting");
+    tracing::info!(version = VERSION, revision = REVISION, ?cfg, "k8netd starting");
 
     // REQ-011: retired static-forward variables are ignored (no hard
     // failure, so an old unit file still boots); warn so operators update.

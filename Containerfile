@@ -14,9 +14,14 @@
 
 # --- stage 1: build k8netd ---------------------------------------------------
 FROM docker.io/library/rust:1.97.1 AS build
+ARG VERSION=
+ARG REVISION=
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates ./crates
+# build.rs reads these and bakes them into the binary (k8netd --version +
+# startup log); empty values fall back to CARGO_PKG_VERSION and "unknown".
+ENV K8NETD_VERSION=$VERSION K8NETD_REVISION=$REVISION
 RUN cargo build --release --workspace
 
 # --- stage 2: passt from the matching Debian suite ---------------------------
@@ -30,6 +35,12 @@ COPY --from=build /etc/services /etc/services
 
 # --- stage 3: distroless runtime ---------------------------------------------
 FROM gcr.io/distroless/cc-debian13
+# Provenance labels so `podman inspect` identifies any published image
+# without running it (VERSION = full image tag, e.g. v0.1.2 or edge).
+ARG VERSION=
+ARG REVISION=
+LABEL org.opencontainers.image.version="$VERSION"
+LABEL org.opencontainers.image.revision="$REVISION"
 COPY --from=build /src/target/release/k8netd /k8netd
 COPY --from=passt /usr/bin/passt /usr/bin/passt
 COPY --from=passt /etc/ethertypes /etc/ethertypes

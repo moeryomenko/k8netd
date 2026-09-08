@@ -17,6 +17,11 @@ test: ## Run the test suite
 help: ## Print this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "%-12s %s\n", $$1, $$2}'
 IMAGE ?= localhost/k8netd:dev
+# Artifact self-identification (baked via Containerfile build args): VERSION is
+# the full ref name (release tag like v0.1.2, or "edge"/"dev"); REVISION is the
+# commit the image was built from. CI overrides both; local builds default here.
+VERSION ?= dev
+REVISION ?= $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
 
 image: ## Build the k8netd runtime image (podman)
-	podman build -t $(IMAGE) -f Containerfile .
+	podman build --build-arg VERSION=$(VERSION) --build-arg REVISION=$(REVISION) -t $(IMAGE) -f Containerfile .
