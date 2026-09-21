@@ -21,11 +21,12 @@
 use std::io::Write as _;
 use std::io::{self, Read as _};
 use std::os::fd::AsRawFd as _;
-use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use vhost::vhost_user::Listener;
@@ -514,6 +515,18 @@ pub struct VhostPort {
     config: Arc<Mutex<NetDeviceConfig>>,
     /// RX delivery notifier shared with every backend session.
     notify: Arc<EventFd>,
+    socket_path: PathBuf,
+    stop: Arc<AtomicBool>,
+    worker: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl Drop for VhostPort {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        let _ = UnixStream::connect(&self.socket_path);
+        let _ = self.worker.get_mut().expect("worker mutex poisoned").take();
+        let _ = std::fs::remove_file(&self.socket_path);
+    }
 }
 
 impl VhostPort {
@@ -543,12 +556,13 @@ impl VhostPort {
         let session_notify = Arc::clone(&notify);
         let mut listener = Listener::new(path, true).map_err(|e| io::Error::other(e.to_string()))?;
 
-        // Accept/re-listen loop (REQ-010): one frontend session at a time.
-        // A FRESH daemon (and therefore a fresh protocol handler) is built
-        // per session: the handler rejects a second SET_OWNER ("already
-        // claimed") otherwise. Backend state survives via shared Arcs.
-        thread::spawn(move || {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let worker = thread::spawn(move || {
             loop {
+                if thread_stop.load(Ordering::Acquire) {
+                    break;
+                }
                 let mut daemon = match VhostUserDaemon::new(
                     "k8netd-port".to_string(),
                     backend.clone(),
@@ -556,11 +570,17 @@ impl VhostPort {
                 ) {
                     Ok(d) => d,
                     Err(_) => {
+                        if thread_stop.load(Ordering::Acquire) {
+                            break;
+                        }
                         thread::sleep(Duration::from_millis(50));
                         continue;
                     }
                 };
                 if daemon.start(&mut listener).is_err() {
+                    if thread_stop.load(Ordering::Acquire) {
+                        break;
+                    }
                     thread::sleep(Duration::from_millis(50));
                     continue;
                 }
@@ -572,18 +592,31 @@ impl VhostPort {
                 {
                     tracing::warn!(%e, "rx notifier registration failed");
                 }
+                if thread_stop.load(Ordering::Acquire) {
+                    if let Some(sh) = daemon.shutdown_handle() {
+                        sh.shutdown();
+                    }
+                    let _ = daemon.wait();
+                    break;
+                }
                 let _ = daemon.wait();
-                // Tear the session down explicitly: Drop's blind conn.shutdown
-                // wedges the shared listener for the next accept, so the daemon
-                // is forgotten instead (backend state lives in shared Arcs).
                 if let Some(sh) = daemon.shutdown_handle() {
                     sh.shutdown();
+                }
+                if thread_stop.load(Ordering::Acquire) {
+                    break;
                 }
                 std::mem::forget(daemon);
             }
         });
 
-        Ok(VhostPort { config, notify })
+        Ok(VhostPort {
+            config,
+            notify,
+            socket_path: path.to_path_buf(),
+            stop,
+            worker: Mutex::new(Some(worker)),
+        })
     }
 
     /// Pins the NIC MAC served through the virtio_net_config space
