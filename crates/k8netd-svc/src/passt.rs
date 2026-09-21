@@ -82,6 +82,11 @@ pub fn passt_argv(config: &PasstConfig, fd: RawFd) -> Vec<String> {
         config.netmask.clone(),
         "-g".to_string(),
         config.gateway.clone(),
+        // Make the default passt gateway-to-host-loopback translation explicit.
+        // Lab guests use this path to reach the loopback-bound OCI registry at
+        // 192.168.124.1:5000 without exposing it on a physical host interface.
+        "--map-host-loopback".to_string(),
+        config.gateway.clone(),
     ];
     for f in &config.forwards {
         // Bare `hostport:guestport`: verified empirically on BOTH passt
@@ -302,6 +307,8 @@ mod tests {
                 "255.255.255.0",
                 "-g",
                 "192.168.124.1",
+                "--map-host-loopback",
+                "192.168.124.1",
                 "-t6443:6443",
                 "--foreground"
             ]
@@ -314,7 +321,7 @@ mod tests {
     fn argv_multiple_forwards_in_order() -> TestResult {
         let argv = passt_argv(&cfg(&[(6443, 6443), (22, 2222)]), 9);
         assert_eq!(
-            &argv[..9],
+            &argv[..11],
             &[
                 "passt",
                 "--fd",
@@ -324,12 +331,14 @@ mod tests {
                 "-n",
                 "255.255.255.0",
                 "-g",
+                "192.168.124.1",
+                "--map-host-loopback",
                 "192.168.124.1"
             ]
         );
-        assert_eq!(argv[9], "-t6443:6443");
-        assert_eq!(argv[10], "-t22:2222");
-        assert_eq!(argv.len(), 12);
+        assert_eq!(argv[11], "-t6443:6443");
+        assert_eq!(argv[12], "-t22:2222");
+        assert_eq!(argv.len(), 14);
         Ok(())
     }
 
@@ -337,7 +346,7 @@ mod tests {
     #[test]
     fn argv_without_forwards_has_no_t_flags() -> TestResult {
         let argv = passt_argv(&cfg(&[]), 3);
-        assert_eq!(argv.len(), 10);
+        assert_eq!(argv.len(), 12);
         assert!(argv.iter().all(|a| !a.starts_with("-t")));
         Ok(())
     }
@@ -515,7 +524,7 @@ mod tests {
         }
         // Egress unchanged: everything before the forwards is the pinned base.
         assert_eq!(
-            &argv[..9],
+            &argv[..11],
             &[
                 "passt",
                 "--fd",
@@ -525,6 +534,8 @@ mod tests {
                 "-n",
                 "255.255.255.0",
                 "-g",
+                "192.168.124.1",
+                "--map-host-loopback",
                 "192.168.124.1"
             ]
         );
@@ -537,7 +548,7 @@ mod tests {
     fn unpublished_port_renders_no_t_args_egress_unchanged() -> TestResult {
         let config = passt_config_for("192.168.124.20", "255.255.255.0", "192.168.124.1", &BTreeMap::new());
         let argv = passt_argv(&config, 7);
-        assert_eq!(argv.len(), 10, "no published entries: egress prefix plus --foreground");
+        assert_eq!(argv.len(), 12, "no published entries: egress prefix plus --foreground");
         assert!(argv.iter().all(|a| !a.starts_with("-t")));
         Ok(())
     }
