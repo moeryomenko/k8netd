@@ -6,7 +6,7 @@
 //! make the tests pass; the tests module stays at the bottom of the file per
 //! Rust convention.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::net::Ipv4Addr;
 
@@ -57,7 +57,46 @@ impl Ipam {
         }
     }
 
-    /// Returns the network this allocator serves (pool, gateway, CIDR).
+    /// Returns the exact MAC-to-IP bindings for durable persistence.
+    pub fn snapshot(&self) -> BTreeMap<String, String> {
+        self.allocations
+            .iter()
+            .map(|(mac, ip)| (mac.to_string(), ip.to_string()))
+            .collect()
+    }
+
+    /// Restores exact bindings after validating pool membership, uniqueness,
+    /// and MAC/IP syntax. Normal allocation order is intentionally bypassed so
+    /// a restart cannot silently change DHCP reservations.
+    pub fn from_snapshot(network: Network, snapshot: &BTreeMap<String, String>) -> Result<Self, String> {
+        let mut allocations = HashMap::new();
+        for (mac_text, ip_text) in snapshot {
+            let mac: MacAddr = mac_text.parse().map_err(|e| format!("invalid MAC {mac_text}: {e}"))?;
+            let ip: Ipv4Addr = ip_text.parse().map_err(|e| format!("invalid IP {ip_text}: {e}"))?;
+            let value = u32::from(ip);
+            if value < u32::from(network.pool.start) || value > u32::from(network.pool.end) {
+                return Err(format!("IP {ip} for {mac} is outside the allocation pool"));
+            }
+            if allocations.values().any(|bound| *bound == ip) {
+                return Err(format!("duplicate IP allocation {ip}"));
+            }
+            allocations.insert(mac, ip);
+        }
+        Ok(Self { network, allocations })
+    }
+
+    /// Returns a detached copy of the current allocation table for tests and
+    /// persistence adapters.
+    pub fn allocations(&self) -> &HashMap<MacAddr, Ipv4Addr> {
+        &self.allocations
+    }
+
+    /// Returns the network model owned by this allocator.
+    pub fn into_network(self) -> Network {
+        self.network
+    }
+
+    /// Returns the network model without consuming the allocator.
     pub fn network(&self) -> &Network {
         &self.network
     }

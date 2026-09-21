@@ -13,16 +13,16 @@
 //! - `version`: state format version (bumped on structural changes)
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::path::Path;
 
 use crate::model::PublishTable;
 
-/// Version of the state format. Increment on structural changes; on startup,
-/// if the stored version is older than the current version, the store refuses
-/// to load and the daemon starts with empty state.
-const STATE_FORMAT_VERSION: u32 = 1;
+/// Version of the state format. Increment on structural changes. Older versions
+/// are migrated before they are exposed to the runtime.
+const STATE_FORMAT_VERSION: u32 = 2;
 
 /// Path to the state file, relative to the socket directory.
 const STATE_FILE_NAME: &str = "state.json";
@@ -75,9 +75,15 @@ pub struct NetworkState {
     pub dns: Vec<String>,
     /// MTU override (default 1500).
     pub mtu: u16,
+    /// Original CreateNetwork parameters preserve idempotency across restart.
+    #[serde(default)]
+    pub params: Value,
+    /// Inclusive allocator pool bounds.
+    #[serde(default)]
+    pub pool_start: Option<String>,
+    #[serde(default)]
+    pub pool_end: Option<String>,
 }
-
-/// Per-port persisted state.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct PortState {
     /// Attached VM's IP address (if any).
@@ -152,9 +158,37 @@ impl From<StateSnapshot> for StateStore {
     }
 }
 
-/// Deserialize a StateSnapshot from a JSON string slice.
+fn corrupt_state_error() -> StateError {
+    StateError::Corrupt {
+        source: serde_json::from_str::<Value>("").expect_err("empty JSON is invalid"),
+    }
+}
+
+fn deserialize_snapshot(data: &str) -> Result<StateSnapshot, StateError> {
+    let mut value: Value = serde_json::from_str(data).map_err(|e| StateError::Corrupt { source: e })?;
+    let object = value.as_object_mut().ok_or_else(corrupt_state_error)?;
+    let version = object
+        .get("version")
+        .and_then(Value::as_u64)
+        .ok_or_else(corrupt_state_error)? as u32;
+    match version {
+        1 => {
+            object.insert("version".to_string(), Value::from(STATE_FORMAT_VERSION));
+        }
+        STATE_FORMAT_VERSION => {}
+        found => {
+            return Err(StateError::VersionMismatch {
+                expected: STATE_FORMAT_VERSION,
+                found,
+            });
+        }
+    }
+    serde_json::from_value(value).map_err(|e| StateError::Corrupt { source: e })
+}
+
+/// Deserialize a StateSnapshot from a JSON string slice, migrating version 1.
 pub fn parse_snapshot(data: &str) -> Result<StateSnapshot, StateError> {
-    serde_json::from_str(data).map_err(|e| StateError::Corrupt { source: e })
+    deserialize_snapshot(data)
 }
 
 /// Serialize a StateSnapshot into a JSON string.
@@ -174,17 +208,15 @@ pub fn load_from_disk(path: &Path) -> Result<StateStore, StateError> {
     }
     let content = fs::read_to_string(&state_path).map_err(|e| StateError::Io {
         source: e,
-        path: state_path,
+        path: state_path.clone(),
     })?;
-    let snapshot: StateSnapshot = serde_json::from_str(&content).map_err(|e| StateError::Corrupt { source: e })?;
-    // Validate version
-    if snapshot.version != STATE_FORMAT_VERSION {
-        return Err(StateError::VersionMismatch {
-            expected: STATE_FORMAT_VERSION,
-            found: snapshot.version,
-        });
+    let raw: Value = serde_json::from_str(&content).map_err(|e| StateError::Corrupt { source: e })?;
+    let was_v1 = raw.get("version").and_then(Value::as_u64) == Some(1);
+    let store: StateStore = deserialize_snapshot(&content)?.into();
+    if was_v1 {
+        save_to_disk(&store, path)?;
     }
-    Ok(snapshot.into())
+    Ok(store)
 }
 
 /// Persist the current state to disk atomically (temp file + rename).
@@ -202,12 +234,26 @@ pub fn save_to_disk(store: &StateStore, path: &Path) -> Result<(), StateError> {
         source: e,
         path: tmp_path.clone(),
     })?;
-    // Atomic rename — if the process crashes before this line, the
-    // original state file is untouched.
+    File::open(&tmp_path)
+        .and_then(|file| file.sync_all())
+        .map_err(|e| StateError::Io {
+            source: e,
+            path: tmp_path.clone(),
+        })?;
+    // Atomic rename — if the process crashes before this line, the original
+    // state file is untouched.
     fs::rename(&tmp_path, &state_path).map_err(|e| StateError::Io {
         source: e,
         path: state_path,
     })?;
+    OpenOptions::new()
+        .read(true)
+        .open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|e| StateError::Io {
+            source: e,
+            path: path.to_path_buf(),
+        })?;
     Ok(())
 }
 
@@ -314,3 +360,43 @@ pub fn dhcp_lease_count(store: &StateStore) -> usize {
 // //     StateStore::save_to_disk(&store, socket_dir.join(STATE_FILE_NAME))?;
 // //     StateStore::load_from_disk(socket_dir.join(STATE_FILE_NAME))
 // // }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_directory() -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "k8netd-state-test-{}",
+            SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos()
+        ));
+        fs::create_dir(&path).expect("temporary directory");
+        path
+    }
+
+    #[test]
+    fn migrates_version_one_and_rewrites_current_schema() {
+        let directory = temp_directory();
+        let legacy = r#"{"version":1,"networks":{"lab":{"cidr":"192.168.124.0/24","gateway":"192.168.124.1","dns":[],"mtu":1500}},"ports":{},"ipam_records":{},"dhcp_leases":{}}"#;
+        fs::write(directory.join(STATE_FILE_NAME), legacy).expect("write legacy state");
+
+        let restored = load_from_disk(&directory).expect("legacy state migrates");
+        assert_eq!(restored.networks["lab"].params, Value::Null);
+        let migrated = fs::read_to_string(directory.join(STATE_FILE_NAME)).expect("read migrated state");
+        assert!(migrated.contains("\"version\":2"));
+    }
+
+    #[test]
+    fn rejects_future_versions_without_replacing_original() {
+        let directory = temp_directory();
+        let path = directory.join(STATE_FILE_NAME);
+        let future = r#"{"version":99,"networks":{},"ports":{},"ipam_records":{},"dhcp_leases":{}}"#;
+        fs::write(&path, future).expect("write future state");
+        assert!(matches!(
+            load_from_disk(&directory),
+            Err(StateError::VersionMismatch { found: 99, .. })
+        ));
+        assert_eq!(fs::read_to_string(path).expect("read original"), future);
+    }
+}

@@ -58,7 +58,10 @@ fn main() {
     // control socket; port sockets and the state file live in socket_dir
     // (spec REQ-001/REQ-010). The configured resolvers seed the gateway DNS
     // forwarder (REQ-006) until overridden via set_dns_upstreams.
-    let mut dataplane = dataplane::Dataplane::new(&cfg.socket_dir);
+    let mut dataplane = dataplane::Dataplane::try_new(&cfg.socket_dir).unwrap_or_else(|error| {
+        tracing::error!(%error, "cannot restore persisted k8netd state");
+        std::process::exit(1);
+    });
     dataplane.set_dns_upstreams(
         cfg.upstream_dns
             .iter()

@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 
 use k8netd_core::ipam::{Ipam, IpamError};
 use k8netd_core::model::{IpPool, MacAddr, PublishTable};
+use k8netd_core::state::{IpamSnapshot, NetworkState, PortState, StateStore};
 use k8netd_core::switch::engine::Switch;
 use k8netd_core::switch::gateway::{Gateway, GatewayAction};
 use k8netd_core::switch::mac_table::PortId;
@@ -163,11 +164,27 @@ impl Dataplane {
     /// a daemon restart; a missing or unreadable state file starts empty.
     /// DNS starts with no upstreams — wire config defaults through
     /// [`set_dns_upstreams`](Self::set_dns_upstreams) before serving.
+    /// Test-friendly constructor for empty or pre-existing publish state.
     pub fn new(socket_dir: impl Into<PathBuf>) -> Self {
         let socket_dir = socket_dir.into();
         let publish_table = k8netd_core::state::load_from_disk(&socket_dir)
             .map(|store| store.publish_table)
             .unwrap_or_default();
+        Self::from_parts(socket_dir, publish_table)
+    }
+
+    /// Creates a dataplane and fails closed when persisted state is corrupt or
+    /// incompatible. The compatibility constructor below remains for focused
+    /// unit tests that use isolated empty temporary directories.
+    pub fn try_new(socket_dir: impl Into<PathBuf>) -> Result<Self, String> {
+        let socket_dir = socket_dir.into();
+        let publish_table = k8netd_core::state::load_from_disk(&socket_dir)
+            .map_err(|error| format!("load persisted k8netd state: {error}"))?
+            .publish_table;
+        Ok(Self::from_parts(socket_dir, publish_table))
+    }
+
+    fn from_parts(socket_dir: PathBuf, publish_table: PublishTable) -> Self {
         Dataplane {
             socket_dir,
             inner: Arc::new(Mutex::new(Inner {
@@ -196,12 +213,48 @@ impl Dataplane {
         tracing::info!(upstreams = count, "dns upstreams configured");
     }
 
-    /// Persists the publish table to `state.json` (REQ-010 atomic save).
+    /// Persists the complete network, port, IPAM, and publish state.
     fn persist(&self, inner: &Inner) -> Result<(), RpcError> {
-        let store = k8netd_core::state::StateStore {
+        let mut store = StateStore {
             publish_table: inner.publish_table.clone(),
-            ..k8netd_core::state::StateStore::default()
+            ..StateStore::default()
         };
+        for (name, entry) in &inner.networks {
+            let network = entry.ipam.network();
+            store.networks.insert(
+                name.clone(),
+                NetworkState {
+                    cidr: network.cidr.to_string(),
+                    gateway: network.gateway.to_string(),
+                    dns: Vec::new(),
+                    mtu: 1500,
+                    params: entry.created_with.clone(),
+                    pool_start: Some(network.pool.start.to_string()),
+                    pool_end: Some(network.pool.end.to_string()),
+                },
+            );
+            store.ipam_records.extend(entry.ipam.snapshot());
+        }
+        for (name, port) in &inner.ports {
+            store.ports.insert(
+                name.clone(),
+                PortState {
+                    vm_ip: port
+                        .mac
+                        .and_then(|mac| {
+                            port.network
+                                .as_ref()
+                                .and_then(|network| inner.networks.get(network)?.ipam.lookup(mac))
+                        })
+                        .map(|ip| ip.to_string()),
+                    mac: port.mac.map(|mac| mac.to_string()),
+                    ipam: IpamSnapshot {
+                        free_ranges: Vec::new(),
+                        allocations: BTreeMap::new(),
+                    },
+                },
+            );
+        }
         k8netd_core::state::save_to_disk(&store, &self.socket_dir).map_err(|_| RpcError::Internal)
     }
 
@@ -301,6 +354,7 @@ impl ControlPlane for Dataplane {
                 created_with: params.clone(),
             },
         );
+        self.persist(&g)?;
         Ok(Value::Null)
     }
 
@@ -308,7 +362,9 @@ impl ControlPlane for Dataplane {
         let name = str_p(params, "name")?;
         let mut g = lock(&self.inner)?;
         g.gateway.remove_network(name);
-        g.networks.remove(name).map(|_| Value::Null).ok_or(RpcError::NotFound)
+        let removed = g.networks.remove(name).map(|_| Value::Null).ok_or(RpcError::NotFound)?;
+        self.persist(&g)?;
+        Ok(removed)
     }
 
     fn get_network(&mut self, params: &Value) -> Result<Value, RpcError> {
@@ -362,6 +418,7 @@ impl ControlPlane for Dataplane {
             },
         );
         Dataplane::spawn_passt_reader(name, Arc::clone(&self.inner), _inject_tx_for_test, vhost);
+        self.persist(&g)?;
         Ok(Value::Null)
     }
 
@@ -371,6 +428,13 @@ impl ControlPlane for Dataplane {
         match g.ports.remove(name) {
             Some(lp) => {
                 let num = lp.id;
+                if let (Some(network), Some(mac)) = (lp.network, lp.mac)
+                    && let Some(entry) = g.networks.get_mut(&network)
+                {
+                    // Delete owns the final lifecycle cleanup; stale/missing
+                    // allocations are already absent and need no retry error.
+                    let _ = entry.ipam.release(mac);
+                }
                 g.switch.remove_port(PortId(num));
                 g.gateway.remove_port(PortId(num));
                 g.names.remove(&num);
@@ -405,21 +469,22 @@ impl ControlPlane for Dataplane {
         let mac: MacAddr = str_p(params, "mac")?.parse().map_err(|_| RpcError::InvalidParams)?;
 
         let mut g = lock(&self.inner)?;
-        if !g.ports.contains_key(&port_name) {
-            return Err(RpcError::NotFound);
+        {
+            let port = g.ports.get(&port_name).ok_or(RpcError::NotFound)?;
+            if port.network.as_deref() == Some(net_name.as_str()) && port.mac == Some(mac) {
+                return Ok(Value::Null); // idempotent re-attach
+            }
+            if port.network.is_some() {
+                return Err(RpcError::Conflict);
+            }
         }
         {
-            let e = g.networks.get_mut(&net_name).ok_or(RpcError::NotFound)?;
-            // REQ-004: reserve before boot.
-            e.ipam.allocate(mac).map_err(ipam_err)?;
+            let network = g.networks.get_mut(&net_name).ok_or(RpcError::NotFound)?;
+            // Reserve only after attachment compatibility is established so a
+            // conflicting request cannot leak an IPAM allocation.
+            network.ipam.allocate(mac).map_err(ipam_err)?;
         }
         let port = g.ports.get_mut(&port_name).expect("checked above");
-        if port.network.as_deref() == Some(net_name.as_str()) && port.mac == Some(mac) {
-            return Ok(Value::Null); // idempotent re-attach
-        }
-        if port.network.is_some() {
-            return Err(RpcError::Conflict);
-        }
         // Pin the NIC MAC into the device config space so the guest driver
         // probes with exactly the address reserved here (REQ-004/REQ-009).
         port.vhost.set_mac(mac.octets());
@@ -438,6 +503,7 @@ impl ControlPlane for Dataplane {
         // forwards (ensure_passt restarts passt when the forward set changes).
         let vm_ip = g.networks[&net_name].ipam.lookup(mac).ok_or(RpcError::NotFound)?;
         ensure_passt(&mut g, &port_name, &vm_ip.to_string(), BTreeMap::new())?;
+        self.persist(&g)?;
 
         Ok(Value::Null)
     }
@@ -445,12 +511,17 @@ impl ControlPlane for Dataplane {
     fn detach_port(&mut self, params: &Value) -> Result<Value, RpcError> {
         let name = str_p(params, "name")?;
         let mut g = lock(&self.inner)?;
-        let p = g.ports.get_mut(name).ok_or(RpcError::NotFound)?;
-        // Socket stays alive across detach (REQ-003); leave the L2 segment.
-        p.network = None;
-        p.mac = None;
-        let id = p.id;
+        let (id, network, mac) = {
+            let p = g.ports.get_mut(name).ok_or(RpcError::NotFound)?;
+            // Socket stays alive across detach (REQ-003); leave the L2 segment.
+            (p.id, p.network.take(), p.mac.take())
+        };
         g.gateway.remove_port(PortId(id));
+        g.switch.remove_port(PortId(id));
+        if let (Some(network), Some(mac)) = (network, mac) {
+            let entry = g.networks.get_mut(&network).ok_or(RpcError::NotFound)?;
+            entry.ipam.release(mac).map_err(ipam_err)?;
+        }
         // REQ-010: detaching the owning port frees its published allocations.
         g.publish_table.remove_port(name);
         self.persist(&g)?;
@@ -479,6 +550,7 @@ impl ControlPlane for Dataplane {
             IpamError::UnknownMac => RpcError::NotFound,
             other => ipam_err(other),
         })?;
+        self.persist(&g)?;
         Ok(Value::Null)
     }
 
