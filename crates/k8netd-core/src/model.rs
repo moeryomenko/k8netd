@@ -306,6 +306,16 @@ impl PublishTable {
         self.entries.remove(port).is_some()
     }
 
+    /// Removes one published `(port, vm_port)` mapping and returns its host port.
+    pub fn remove(&mut self, port: &str, vm_port: u16) -> Option<u16> {
+        let entries = self.entries.get_mut(port)?;
+        let host_port = entries.remove(&vm_port)?;
+        if entries.is_empty() {
+            self.entries.remove(port);
+        }
+        Some(host_port)
+    }
+
     /// Allocates the lowest free host_port in the inclusive `range` for
     /// `(port, vm_port)`, records it, and returns it.
     ///

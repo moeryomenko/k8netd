@@ -44,6 +44,7 @@ pub trait ControlPlane {
     /// allocated host port (REQ-010). Idempotent per pair; errors for
     /// unknown or unattached ports; exhaustion surfaces as `conflict`.
     fn publish_port(&mut self, params: &Value) -> Result<Value, RpcError>;
+    fn unpublish_port(&mut self, params: &Value) -> Result<Value, RpcError>;
 }
 
 /// Routes parsed requests to a [`ControlPlane`], mapping domain failures to
@@ -72,6 +73,7 @@ impl<C: ControlPlane> Router<C> {
             "AllocateIP" => self.cp.allocate_ip(req.params.as_ref().unwrap_or(&Value::Null)),
             "ReleaseIP" => self.cp.release_ip(req.params.as_ref().unwrap_or(&Value::Null)),
             "PublishPort" => self.cp.publish_port(req.params.as_ref().unwrap_or(&Value::Null)),
+            "UnpublishPort" => self.cp.unpublish_port(req.params.as_ref().unwrap_or(&Value::Null)),
             _ => Err(RpcError::MethodNotFound),
         };
         match result {
@@ -330,6 +332,15 @@ impl ControlPlane for MemoryControlPlane {
                 .ok_or(RpcError::Conflict)?, // range exhaustion; no partial state
         };
         Ok(json!({ "host_port": host_port }))
+    }
+
+    fn unpublish_port(&mut self, params: &Value) -> Result<Value, RpcError> {
+        let port_name = str_param(params, "port")?;
+        let vm_port = u16_param(params, "vm_port")?;
+        self.publish_table
+            .remove(port_name, vm_port)
+            .ok_or(RpcError::NotFound)?;
+        Ok(Value::Null)
     }
 }
 

@@ -592,6 +592,32 @@ impl ControlPlane for Dataplane {
 
         Ok(json!({ "host_port": host_port }))
     }
+
+    fn unpublish_port(&mut self, params: &Value) -> Result<Value, RpcError> {
+        let port_name = str_p(params, "port")?;
+        let vm_port = u16_p(params, "vm_port")?;
+        let mut g = lock(&self.inner)?;
+        g.publish_table.remove(port_name, vm_port).ok_or(RpcError::NotFound)?;
+        self.persist(&g)?;
+        let published = g.publish_table.entries.get(port_name).cloned().unwrap_or_default();
+        if published.is_empty() {
+            teardown_passt(&mut g, port_name);
+        } else {
+            let port = g.ports.get(port_name).ok_or(RpcError::NotFound)?;
+            let net_name = port.network.clone().ok_or(RpcError::NotFound)?;
+            let mac = port.mac.ok_or(RpcError::Internal)?;
+            let vm_ip = g
+                .networks
+                .get(&net_name)
+                .ok_or(RpcError::NotFound)?
+                .ipam
+                .lookup(mac)
+                .ok_or(RpcError::NotFound)?;
+            ensure_passt(&mut g, port_name, &vm_ip.to_string(), published)?;
+        }
+        tracing::info!(port = port_name, vm_port, "unpublished port forward");
+        Ok(Value::Null)
+    }
 }
 
 // -- wiring seams (TASK-004) ------------------------------------------------
