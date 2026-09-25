@@ -8,7 +8,8 @@
 #   systemctl --user daemon-reload
 #   systemctl --user start k8netd
 #
-# Build the image first: make image  (-> localhost/k8netd:dev)
+# Production uses the immutable release image; local development may override
+# Image= before installing this unit.
 
 [Unit]
 Description=k8netd rootless userspace L2 switch for cloud-hypervisor VMs
@@ -16,7 +17,7 @@ Wants=default.target
 After=default.target
 
 [Container]
-Image=localhost/k8netd:dev
+Image=ghcr.io/moeryomenko/k8netd:v0.2.2
 Network=host
 
 # Single bind, identical paths both sides (grill D6): control.sock, every
