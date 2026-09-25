@@ -1419,7 +1419,7 @@ for a in "$@"; do
   prev="$a"
 done
 echo $$ >> "$LOG"
-printf '%s\n' "$*" >> "$ARGV"
+printf '%s %s\n' "$$" "$*" >> "$ARGV"
 "#,
         );
         match flavor {
@@ -1481,15 +1481,28 @@ cat <&$FD > "$ROOT/egress.bin"
             .unwrap_or_default()
     }
 
-    fn passt_pids(root: &std::path::Path) -> Vec<u32> {
-        read_lines(&root.join("pids.log"))
-            .into_iter()
-            .filter_map(|l| l.trim().parse().ok())
-            .collect()
-    }
-
     fn argv_lines(root: &std::path::Path) -> Vec<String> {
         read_lines(&root.join("argv.log"))
+    }
+
+    fn argv_for_pid(root: &std::path::Path, pid: u32) -> Option<String> {
+        let prefix = format!("{pid} ");
+        argv_lines(root)
+            .into_iter()
+            .find_map(|line| line.strip_prefix(&prefix).map(str::to_string))
+    }
+
+    fn live_passt_pid(dp: &Dataplane, port: &str) -> Option<u32> {
+        let g = dp.inner.lock().unwrap_or_else(|p| p.into_inner());
+        g.passts.get(port)?.live.as_ref().map(PasstProc::id)
+    }
+
+    fn wait_passt_invocation(root: &std::path::Path, pid: u32) -> bool {
+        poll_until(
+            || argv_for_pid(root, pid).is_some(),
+            Duration::from_secs(5),
+            "passt invocation",
+        )
     }
 
     /// Polls `cond` until true or `timeout` elapses.
@@ -1525,20 +1538,24 @@ cat <&$FD > "$ROOT/egress.bin"
         Ok((dp, ip.as_str().expect("bare ip string").to_string()))
     }
 
+    fn attached_dp_with_observed_passt(
+        dir: &std::path::Path,
+        port: &str,
+        mac: &str,
+    ) -> Result<(Dataplane, String), Box<dyn std::error::Error + Send + Sync>> {
+        let (dp, ip) = attached_dp(dir, port, mac)?;
+        let pid = live_passt_pid(&dp, port).ok_or("attach_port did not start passt")?;
+        if !wait_passt_invocation(dir, pid) {
+            return Err("attach_port did not log its no-forward passt".into());
+        }
+        Ok((dp, ip))
+    }
+
     fn publish(dp: &mut Dataplane, port: &str, vm_port: u16) -> u16 {
         let r = dp
             .publish_port(&serde_json::json!({"port": port, "vm_port": vm_port}))
             .expect("publish_port must succeed for an attached port");
         r["host_port"].as_u64().expect("host_port field") as u16
-    }
-
-    /// Waits until the passt stub logged at least `n` invocations.
-    fn wait_invocations(root: &std::path::Path, n: usize) -> bool {
-        poll_until(
-            || argv_lines(root).len() >= n && passt_pids(root).len() >= n,
-            Duration::from_secs(5),
-            "passt invocation",
-        )
     }
 
     /// Waits for the RX used ring to publish element `elem`, returns its len.
@@ -1728,16 +1745,17 @@ cat <&$FD > "$ROOT/egress.bin"
         let root = passt_temp_root("pub-argv");
         std::fs::create_dir_all(&root)?;
         let _guard = install_passt_stub(&root, "plain")?;
-        let (mut dp, ip) = attached_dp(&root, "vm1", "02:00:00:00:00:01")?;
+        let (mut dp, ip) = attached_dp_with_observed_passt(&root, "vm1", "02:00:00:00:00:01")?;
 
         let hp = publish(&mut dp, "vm1", 6443);
+        let pid = live_passt_pid(&dp, "vm1").expect("published passt");
 
         assert!(
-            wait_invocations(&root, 1),
-            "publish_port must ensure a passt process (none spawned)"
+            wait_passt_invocation(&root, pid),
+            "publish_port must log its replacement passt"
         );
         let want_fwd = format!("-t{hp}:6443");
-        let last = argv_lines(&root).last().expect("argv recorded").clone();
+        let last = argv_for_pid(&root, pid).expect("published argv recorded");
         let tokens: Vec<&str> = last.split_whitespace().collect();
         let a_pos = tokens.iter().position(|t| *t == "-a");
         assert_eq!(
@@ -1765,24 +1783,27 @@ cat <&$FD > "$ROOT/egress.bin"
         let root = passt_temp_root("pub-idem");
         std::fs::create_dir_all(&root)?;
         let _guard = install_passt_stub(&root, "plain")?;
-        let (mut dp, _ip) = attached_dp(&root, "vm1", "02:00:00:00:00:01")?;
+        let (mut dp, _ip) = attached_dp_with_observed_passt(&root, "vm1", "02:00:00:00:00:01")?;
 
         let hp1 = publish(&mut dp, "vm1", 6443);
-        assert!(wait_invocations(&root, 1), "first publish must ensure passt");
+        let pid = live_passt_pid(&dp, "vm1").expect("published passt");
+        assert!(
+            wait_passt_invocation(&root, pid),
+            "first publish must log its replacement passt"
+        );
 
         // Let any buggy immediate-thrash surface before the re-publish.
         std::thread::sleep(Duration::from_millis(300));
-        let count_before = argv_lines(&root).len();
 
         let hp2 = publish(&mut dp, "vm1", 6443);
         assert_eq!(hp1, hp2, "re-publish must be idempotent");
         std::thread::sleep(Duration::from_millis(400));
         assert_eq!(
-            argv_lines(&root).len(),
-            count_before,
+            live_passt_pid(&dp, "vm1"),
+            Some(pid),
             "identical re-publish must not respawn passt"
         );
-        let last = argv_lines(&root).last().expect("argv recorded").clone();
+        let last = argv_for_pid(&root, pid).expect("published argv recorded");
         assert!(last.contains(&format!("-t{hp1}:6443")), "argv unchanged: [{last}]");
 
         let _ = dp.delete_port(&serde_json::json!({"name": "vm1"}));
@@ -1809,11 +1830,12 @@ cat <&$FD > "$ROOT/egress.bin"
         dp.attach_port(&serde_json::json!({"port": "vm1", "network": "net0", "mac": "02:00:00:00:00:01"}))
             .map_err(|e| format!("attach_port: {e:?}"))?;
 
+        let pid = live_passt_pid(&dp, "vm1").expect("attached passt");
         assert!(
-            wait_invocations(&root, 1),
-            "attach_port must ensure a passt process (none spawned)"
+            wait_passt_invocation(&root, pid),
+            "attach_port must log its passt process"
         );
-        let last = argv_lines(&root).last().expect("argv recorded").clone();
+        let last = argv_for_pid(&root, pid).expect("attached argv recorded");
         let tokens: Vec<&str> = last.split_whitespace().collect();
         assert!(
             tokens.iter().any(|t| *t == "-a"),
@@ -1839,22 +1861,24 @@ cat <&$FD > "$ROOT/egress.bin"
         let root = passt_temp_root("pub-restart");
         std::fs::create_dir_all(&root)?;
         let _guard = install_passt_stub(&root, "plain")?;
-        let (mut dp, _ip) = attached_dp(&root, "vm1", "02:00:00:00:00:01")?;
+        let (mut dp, _ip) = attached_dp_with_observed_passt(&root, "vm1", "02:00:00:00:00:01")?;
 
         let hp_api = publish(&mut dp, "vm1", 6443);
-        assert!(wait_invocations(&root, 1), "first publish must ensure passt");
-        std::thread::sleep(Duration::from_millis(200));
-        let count_before = argv_lines(&root).len();
-        let first_pid = passt_pids(&root).last().copied().expect("first pid");
+        let first_pid = live_passt_pid(&dp, "vm1").expect("first published passt");
+        assert!(
+            wait_passt_invocation(&root, first_pid),
+            "first publish must log its replacement passt"
+        );
 
         let hp_ssh = publish(&mut dp, "vm1", 22);
+        let second_pid = live_passt_pid(&dp, "vm1").expect("second published passt");
 
+        assert_ne!(first_pid, second_pid, "second vm_port publish must restart passt");
         assert!(
-            wait_invocations(&root, count_before + 1),
-            "second vm_port publish must restart passt (invocations: {})",
-            argv_lines(&root).len()
+            wait_passt_invocation(&root, second_pid),
+            "second vm_port publish must log its replacement passt"
         );
-        let last = argv_lines(&root).last().expect("argv recorded").clone();
+        let last = argv_for_pid(&root, second_pid).expect("restarted argv recorded");
         assert!(
             last.contains(&format!("-t{hp_api}:6443")),
             "restarted argv keeps the first forward: [{last}]"
@@ -1884,11 +1908,14 @@ cat <&$FD > "$ROOT/egress.bin"
         let root = passt_temp_root("life-del");
         std::fs::create_dir_all(&root)?;
         let _guard = install_passt_stub(&root, "plain")?;
-        let (mut dp, _ip) = attached_dp(&root, "vm1", "02:00:00:00:00:01")?;
+        let (mut dp, _ip) = attached_dp_with_observed_passt(&root, "vm1", "02:00:00:00:00:01")?;
 
         let _hp = publish(&mut dp, "vm1", 6443);
-        assert!(wait_invocations(&root, 1), "publish must ensure passt");
-        let pid = passt_pids(&root).last().copied().expect("passt pid");
+        let pid = live_passt_pid(&dp, "vm1").expect("published passt");
+        assert!(
+            wait_passt_invocation(&root, pid),
+            "publish must log its replacement passt"
+        );
         assert!(pid_alive(pid), "passt must be running before delete");
 
         dp.delete_port(&serde_json::json!({"name": "vm1"}))
@@ -1912,11 +1939,14 @@ cat <&$FD > "$ROOT/egress.bin"
         let root = passt_temp_root("life-det");
         std::fs::create_dir_all(&root)?;
         let _guard = install_passt_stub(&root, "plain")?;
-        let (mut dp, _ip) = attached_dp(&root, "vm1", "02:00:00:00:00:01")?;
+        let (mut dp, _ip) = attached_dp_with_observed_passt(&root, "vm1", "02:00:00:00:00:01")?;
 
         let _hp = publish(&mut dp, "vm1", 6443);
-        assert!(wait_invocations(&root, 1), "publish must ensure passt");
-        let pid = passt_pids(&root).last().copied().expect("passt pid");
+        let pid = live_passt_pid(&dp, "vm1").expect("published passt");
+        assert!(
+            wait_passt_invocation(&root, pid),
+            "publish must log its replacement passt"
+        );
 
         dp.detach_port(&serde_json::json!({"name": "vm1"}))
             .expect("detach_port ok");
@@ -1939,31 +1969,46 @@ cat <&$FD > "$ROOT/egress.bin"
         let _path_lock = PASST_PATH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let root = passt_temp_root("life-crash");
         std::fs::create_dir_all(&root)?;
-        std::fs::write(root.join("crash-now"), b"")?;
         let _guard = install_passt_stub(&root, "crash")?;
-        let (mut dp, _ip) = attached_dp(&root, "vm1", "02:00:00:00:00:01")?;
+        let (mut dp, _ip) = attached_dp_with_observed_passt(&root, "vm1", "02:00:00:00:00:01")?;
 
+        std::fs::write(root.join("crash-now"), b"")?;
         let _hp = publish(&mut dp, "vm1", 6443);
+        let crashed_pid = live_passt_pid(&dp, "vm1").expect("crashing published passt");
         assert!(
-            wait_invocations(&root, 2),
-            "daemon must notice the exited passt and re-ensure it (invocations: {})",
-            argv_lines(&root).len()
+            wait_passt_invocation(&root, crashed_pid),
+            "published passt must log before crashing"
         );
-        let pids = passt_pids(&root);
-        assert!(
-            pids.windows(2).any(|w| w[0] != w[1]),
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let reensured_pid = loop {
+            if let Some(pid) = live_passt_pid(&dp, "vm1")
+                && pid != crashed_pid
+                && argv_for_pid(&root, pid).is_some()
+            {
+                break pid;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "daemon did not re-ensure passt after its unexpected exit"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert_ne!(
+            crashed_pid, reensured_pid,
             "re-ensure must be a fresh process, not a zombie count"
         );
 
-        // Stop the crash loop; the newest passt must stay alive.
+        // Stop the crash loop; the current passt must stay alive.
         let _ = std::fs::remove_file(root.join("crash-now"));
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
-            let stable = passt_pids(&root).last().copied().map(pid_alive).unwrap_or(false);
-            if stable {
-                let p = passt_pids(&root).last().copied().expect("pid");
+            if let Some(pid) = live_passt_pid(&dp, "vm1")
+                && argv_for_pid(&root, pid).is_some()
+                && pid_alive(pid)
+            {
                 std::thread::sleep(Duration::from_millis(400));
-                if pid_alive(p) {
+                if live_passt_pid(&dp, "vm1") == Some(pid) && pid_alive(pid) {
                     break;
                 }
             }
@@ -1992,11 +2037,15 @@ cat <&$FD > "$ROOT/egress.bin"
         let root = passt_temp_root("gw-egress");
         std::fs::create_dir_all(&root)?;
         let _guard = install_passt_stub(&root, "capture")?;
-        let (mut dp, ip) = attached_dp(&root, "vm1", "02:00:00:00:00:09")?;
+        let (mut dp, ip) = attached_dp_with_observed_passt(&root, "vm1", "02:00:00:00:00:09")?;
         // Publishing guarantees a running passt regardless of whether the
         // implementation ensures at attach or at publish time.
         let _hp = publish(&mut dp, "vm1", 6443);
-        assert!(wait_invocations(&root, 1), "passt must be running for the fd test");
+        let pid = live_passt_pid(&dp, "vm1").expect("published passt");
+        assert!(
+            wait_passt_invocation(&root, pid),
+            "publish must log its replacement passt"
+        );
 
         let fe = FakeFrontend::connect(root.join("vm1.sock"))?;
         let mem = fe.mem().clone();
@@ -2081,9 +2130,13 @@ cat <&$FD > "$ROOT/egress.bin"
         let root = passt_temp_root("gw-ingress");
         std::fs::create_dir_all(&root)?;
         let _guard = install_passt_stub(&root, "pipe")?;
-        let (mut dp, _ip) = attached_dp(&root, "vm1", "02:00:00:00:00:09")?;
+        let (mut dp, _ip) = attached_dp_with_observed_passt(&root, "vm1", "02:00:00:00:00:09")?;
         let _hp = publish(&mut dp, "vm1", 6443);
-        assert!(wait_invocations(&root, 1), "passt must be running for the fd test");
+        let pid = live_passt_pid(&dp, "vm1").expect("published passt");
+        assert!(
+            wait_passt_invocation(&root, pid),
+            "publish must log its replacement passt"
+        );
 
         let fe = FakeFrontend::connect(root.join("vm1.sock"))?;
         let mem = fe.mem().clone();
