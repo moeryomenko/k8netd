@@ -1075,12 +1075,11 @@ fn gateway_icmp_reply(g: &Inner, port: &str, frame: &[u8]) -> Option<Vec<u8>> {
 /// Computes the ones-complement Internet checksum over `data`.
 fn inet_checksum(data: &[u8]) -> u16 {
     let mut sum = 0u32;
-    #[allow(clippy::chunks_exact_to_as_chunks)]
-    let mut words = data.chunks_exact(2);
-    for w in &mut words {
-        sum += u32::from(u16::from_be_bytes([w[0], w[1]]));
+    let (words, remainder) = data.as_chunks::<2>();
+    for word in words {
+        sum += u32::from(u16::from_be_bytes(*word));
     }
-    if let [last] = words.remainder() {
+    if let [last] = remainder {
         sum += u32::from(*last) << 8;
     }
     while sum >> 16 != 0 {
@@ -1409,7 +1408,7 @@ mod tests {
     ) -> Result<PasstPathGuard, Box<dyn std::error::Error + Send + Sync>> {
         let bin = root.join("bin");
         std::fs::create_dir_all(&bin)?;
-        let mut s = format!("#!/bin/sh\nROOT=\"{}\"\n", root.display());
+        let mut s = format!("#!/bin/bash\nROOT=\"{}\"\n", root.display());
         s.push_str(
             r#"LOG="$ROOT/pids.log"
 ARGV="$ROOT/argv.log"
